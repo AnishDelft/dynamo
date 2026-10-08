@@ -872,6 +872,8 @@ pub enum OpenApiRouteKind {
     Completions,
     Embeddings,
     Responses,
+    Decisions,
+    SystemOne,
 }
 
 /// Documentation for a route, with optional handler-specific schema metadata.
