@@ -216,6 +216,7 @@ fn fixture_with_preferred_taints(
         },
         kv_transfer_candidates: None,
         retain_kv_transfer_chain: false,
+        hint_inputs: Default::default(),
         shared_cache_hits: None,
         worker_loads,
         resp_tx: None,

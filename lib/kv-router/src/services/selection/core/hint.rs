@@ -1,18 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The KV transfer hint attached to a booked selection, and composition of a booked selection's
-//! KV hint from the router's fetch and its hint policies.
+//! Router-hint fetch rules over a partition's worker snapshot, and composition of a booked
+//! selection's KV hint from its hint policies.
 
 use std::collections::HashSet;
 
 use super::*;
 use crate::plugins::hint_policy::HintPlans;
-use crate::plugins::hint_policy::runtime::{ActionInputs, ActionStage};
+use crate::plugins::hint_policy::runtime::{
+    ActionInputs, ActionStage, FetchSourceRules, KV_HINT_FETCH_ACTION_ID,
+};
 use crate::protocols::KvTransferEnforcement;
 
-/// Action ID of the router's `kv.fetch` action. No other action may use it.
-pub(super) const KV_HINT_FETCH_ACTION_ID: &str = "a1";
 /// Upper bound on the actions one composed hint carries.
 const MAX_KV_HINT_ACTIONS: usize = 32;
 const KV_FETCH_ACTION_TYPE: &str = "kv.fetch";
@@ -28,6 +28,43 @@ pub(super) fn hint_capable_partition(configs: &HashMap<WorkerId, SelectionWorker
     })
 }
 
+/// The router-hint source rules over one published snapshot of a partition's workers. Rebuilt
+/// when the partition publishes a changed worker map, so selections read it without scanning.
+pub(super) struct PartitionFetchRules {
+    configs: HashMap<WorkerId, SelectionWorkerConfig>,
+}
+
+impl PartitionFetchRules {
+    /// The rules for `configs`, or `None` when no worker consumes router hints.
+    pub(super) fn for_partition(
+        configs: &HashMap<WorkerId, SelectionWorkerConfig>,
+    ) -> Option<Self> {
+        hint_capable_partition(configs).then(|| Self {
+            configs: configs.clone(),
+        })
+    }
+}
+
+impl FetchSourceRules for PartitionFetchRules {
+    fn source_for(
+        &self,
+        target: WorkerWithDpRank,
+        local_prefix_blocks: usize,
+        candidates: &KvTransferCandidates,
+    ) -> Option<(KvTransferCandidateSource, usize)> {
+        best_fetch_source(&self.configs, target, local_prefix_blocks, candidates)
+    }
+
+    fn payload(
+        &self,
+        source: KvTransferCandidateSource,
+        prefix_blocks: usize,
+        candidates: &KvTransferCandidates,
+    ) -> Option<KvSourceLocationsPayload> {
+        fetch_payload(&self.configs, source, prefix_blocks, candidates)
+    }
+}
+
 /// Pick the best router-hint source for `target`: a same-role worker (or
 /// cache owner) holding a longer root-aligned prefix than the target's own
 /// `target_cached_prefix_blocks`, with a non-empty control endpoint.
@@ -38,13 +75,12 @@ pub(super) fn hint_capable_partition(configs: &HashMap<WorkerId, SelectionWorker
 /// that publishes no topology uses its attached worker's. With `preferred`
 /// enforcement, a cross-island source is used only when no same-island source
 /// qualifies.
-pub(super) fn transfer_hint_for_selection(
+fn best_fetch_source(
     configs: &HashMap<WorkerId, SelectionWorkerConfig>,
     target: WorkerWithDpRank,
-    target_cached_prefix_blocks: u32,
-    candidates: Option<&KvTransferCandidates>,
-) -> Option<KvSourceLocationsPayload> {
-    let candidates = candidates?;
+    target_cached_prefix_blocks: usize,
+    candidates: &KvTransferCandidates,
+) -> Option<(KvTransferCandidateSource, usize)> {
     let target_config = configs.get(&target.worker_id)?;
     let target_metadata = target_config.kv_hint_transfer_metadata_for_dp_rank(target.dp_rank)?;
 
@@ -74,9 +110,10 @@ pub(super) fn transfer_hint_for_selection(
             }),
     };
 
-    let prefix_blocks_to_beat = usize::try_from(target_cached_prefix_blocks).unwrap_or(usize::MAX);
-    let selected = match target_config.kv_transfer_domain.as_deref() {
-        None => candidates.best_source(prefix_blocks_to_beat, is_eligible),
+    match target_config.kv_transfer_domain.as_deref() {
+        None => candidates.best_ranked_source_prefix(target_cached_prefix_blocks, |source| {
+            is_eligible(source).then_some(())
+        }),
         Some(domain) => {
             let target_island = target_config.topology_domains.get(domain);
             let source_island = |source| match source {
@@ -100,7 +137,7 @@ pub(super) fn transfer_hint_for_selection(
             };
             let preferred =
                 target_config.kv_transfer_enforcement == Some(KvTransferEnforcement::Preferred);
-            candidates.best_ranked_source(prefix_blocks_to_beat, |source| {
+            candidates.best_ranked_source_prefix(target_cached_prefix_blocks, |source| {
                 if !is_eligible(source) {
                     return None;
                 }
@@ -108,8 +145,17 @@ pub(super) fn transfer_hint_for_selection(
                 (same_island || preferred).then_some(same_island)
             })
         }
-    };
-    let (source, block_hashes) = selected?;
+    }
+}
+
+/// The fetch payload for `source`'s first `prefix_blocks` blocks. The endpoint comes from the
+/// snapshot that chose the source; an empty endpoint or prefix gets no payload.
+fn fetch_payload(
+    configs: &HashMap<WorkerId, SelectionWorkerConfig>,
+    source: KvTransferCandidateSource,
+    prefix_blocks: usize,
+    candidates: &KvTransferCandidates,
+) -> Option<KvSourceLocationsPayload> {
     let source_control_endpoint = match source {
         KvTransferCandidateSource::Worker(worker) => configs
             .get(&worker.worker_id)?
@@ -124,13 +170,29 @@ pub(super) fn transfer_hint_for_selection(
             .source_control_endpoint
             .clone(),
     };
-    if block_hashes.is_empty() {
+    let block_hashes = candidates.block_hashes.get(..prefix_blocks)?;
+    if source_control_endpoint.is_empty() || block_hashes.is_empty() {
         return None;
     }
     Some(KvSourceLocationsPayload {
         source_control_endpoint,
-        block_hashes,
+        block_hashes: block_hashes.to_vec(),
     })
+}
+
+/// The fetch payload Dynamo attached before hint policies: the best source for `target` beyond
+/// `target_cached_prefix_blocks`. Kept so the source-rule tests exercise the same rules.
+#[cfg(test)]
+pub(super) fn transfer_hint_for_selection(
+    configs: &HashMap<WorkerId, SelectionWorkerConfig>,
+    target: WorkerWithDpRank,
+    target_cached_prefix_blocks: u32,
+    candidates: Option<&KvTransferCandidates>,
+) -> Option<KvSourceLocationsPayload> {
+    let candidates = candidates?;
+    let prefix_blocks = usize::try_from(target_cached_prefix_blocks).unwrap_or(usize::MAX);
+    let (source, prefix_blocks) = best_fetch_source(configs, target, prefix_blocks, candidates)?;
+    fetch_payload(configs, source, prefix_blocks, candidates)
 }
 
 /// One configured hint policy of a partition, in configured order.
@@ -140,21 +202,21 @@ pub(super) struct HintPolicySlot {
     pub(super) actions: Option<Arc<dyn ActionStage>>,
 }
 
-/// Formulate one booking's KV hint: the router's fetch, if any, then its partition's hint
-/// policies' actions in configured order.
+/// Formulate one booking's KV hint: the fetch committed during selection, if any, then its
+/// partition's hint policies' actions in configured order.
 ///
-/// A policy's output is accepted or rejected whole. Output is rejected when `formulate` fails, an
-/// action ID repeats, an action other than the router's `kv.fetch` uses its ID, a second
-/// `kv.fetch` appears, or the hint would exceed [`MAX_KV_HINT_ACTIONS`]. The output of policies
-/// that committed a plan for the selected worker is checked first, so no other policy's output can
-/// crowd it out; rejecting it fails the booking, because the plan may have decided worker
-/// selection.
-/// Rejecting any other output drops only that policy's actions.
+/// The router materializes the committed fetch itself, from the source and prefix that earned its
+/// credit, so no policy can drop or re-decide it. A policy's output is accepted or rejected whole.
+/// Output is rejected when `formulate` fails, an action ID repeats, an action other than the
+/// router's `kv.fetch` uses its ID, a second `kv.fetch` appears, or the hint would exceed
+/// [`MAX_KV_HINT_ACTIONS`]. The output of policies that committed a plan or fetch for the selected
+/// worker is checked first, so no other policy's output can crowd it out; rejecting it fails the
+/// booking, because the plan or fetch may have decided worker selection. Rejecting any other
+/// output drops only that policy's actions.
 pub(super) fn formulate_kv_hint(
     policies: &[HintPolicySlot],
     mut plans: HintPlans,
     inputs: &ActionInputs<'_>,
-    router_fetch: Option<KvHintAction>,
 ) -> Result<Option<KvHint>, SelectionError> {
     if plans.worker().is_some_and(|worker| worker != inputs.worker) {
         return Err(SelectionError::Internal(format!(
@@ -163,14 +225,16 @@ pub(super) fn formulate_kv_hint(
             inputs.worker
         )));
     }
+    let router_fetch = committed_fetch(policies, &plans, inputs)?;
     let mut outputs = Vec::with_capacity(policies.len());
     for (index, policy) in policies.iter().enumerate() {
         let plan = plans.take_plan(index);
-        let committed = plan.is_some();
+        let committed = plan.is_some() || plans.fetch_for(index).is_some();
         let Some(stage) = &policy.actions else {
             continue;
         };
-        match stage.formulate(&inputs.context(), plan) {
+        let context = inputs.context(stage.requirements(), router_fetch.is_some());
+        match stage.formulate(&context, plan) {
             Ok(actions) if !actions.is_empty() => outputs.push(PolicyOutput {
                 policy,
                 committed,
@@ -204,6 +268,34 @@ pub(super) fn formulate_kv_hint(
         )
         .collect();
     Ok((!actions.is_empty()).then(|| KvHint::new(inputs.request_id, actions)))
+}
+
+/// The `kv.fetch` action for the fetch a policy committed during selection, if any.
+fn committed_fetch(
+    policies: &[HintPolicySlot],
+    plans: &HintPlans,
+    inputs: &ActionInputs<'_>,
+) -> Result<Option<KvHintAction>, SelectionError> {
+    let Some((policy, source)) = policies
+        .iter()
+        .enumerate()
+        .find_map(|(index, policy)| Some((policy, plans.fetch_for(index)?)))
+    else {
+        return Ok(None);
+    };
+    // Selection and formulation read the same source rules and block chain, so a committed
+    // source always has a payload; a missing one is a host bug, not a policy choice.
+    inputs
+        .fetch
+        .as_ref()
+        .and_then(|view| view.action(&source))
+        .map(Some)
+        .ok_or_else(|| {
+            SelectionError::Internal(format!(
+                "hint policy {:?} committed a fetch the router cannot materialize",
+                policy.name
+            ))
+        })
 }
 
 /// One policy's formulated actions, waiting for composition.

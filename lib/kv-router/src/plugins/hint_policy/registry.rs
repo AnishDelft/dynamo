@@ -9,6 +9,7 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
+use super::fetch::{KV_FETCH_HINT_POLICY_TYPE, kv_fetch_provider};
 use super::{HintPolicyInstance, HintRequirements};
 use crate::config::KvRouterConfig;
 use crate::{RoutingPartitionRef, WorkerType};
@@ -87,6 +88,8 @@ impl HintPolicyProviderError {
 pub enum HintPolicyRegistryError {
     #[error("hint-policy type must not be empty")]
     EmptyName,
+    #[error("hint-policy type {name:?} is reserved for Dynamo")]
+    Reserved { name: String },
     #[error("hint-policy type {name:?} is already registered")]
     Duplicate { name: String },
     #[error("could not load hint_policies from router_policy_config: {source}")]
@@ -112,6 +115,10 @@ pub enum HintPolicyRegistryError {
         declared: HintRequirements,
         actual: HintRequirements,
     },
+    #[error(
+        "hint policies {first:?} and {second:?} both read KV fetch sources for one worker role"
+    )]
+    ConflictingFetchPolicies { first: String, second: String },
 }
 
 #[derive(Clone)]
@@ -159,6 +166,7 @@ impl HintPolicyFactory {
                 });
             }
         }
+        validate_role(&policies)?;
         Ok(Self {
             roles: Arc::new([
                 policies.clone(),
@@ -232,7 +240,7 @@ const WORKER_TYPES: [WorkerType; 4] = [
     WorkerType::Encode,
 ];
 
-/// Linked hint-policy providers.
+/// Linked hint-policy providers. Dynamo's `kv_fetch` preset is always available.
 #[derive(Clone, Default)]
 pub(crate) struct HintPolicyRegistry {
     providers: HashMap<String, HintPolicyProvider>,
@@ -251,6 +259,9 @@ impl HintPolicyRegistry {
         let name = name.into();
         if name.is_empty() {
             return Err(HintPolicyRegistryError::EmptyName);
+        }
+        if name == KV_FETCH_HINT_POLICY_TYPE {
+            return Err(HintPolicyRegistryError::Reserved { name });
         }
         if self.providers.contains_key(&name) {
             return Err(HintPolicyRegistryError::Duplicate { name });
@@ -294,6 +305,7 @@ impl HintPolicyRegistry {
                 resolved.insert(name, policy.clone());
                 policies.push(policy);
             }
+            validate_role(&policies)?;
             roles[role_index(worker_type)] = policies;
         }
         // Validate instances no role lists too, so a typo in one fails at startup.
@@ -321,21 +333,41 @@ impl HintPolicyRegistry {
         policy_type: &str,
         parameters: HintPolicyParameters,
     ) -> Result<HintPolicyDefinition, HintPolicyRegistryError> {
+        let provider_error = |source| HintPolicyRegistryError::Provider {
+            policy_type: policy_type.to_owned(),
+            source,
+        };
+        if policy_type == KV_FETCH_HINT_POLICY_TYPE {
+            return kv_fetch_provider(&parameters).map_err(provider_error);
+        }
         let provider = self.providers.get(policy_type).ok_or_else(|| {
             HintPolicyRegistryError::UnknownType {
                 name: policy_type.to_owned(),
                 available: self.available_policy_types(),
             }
         })?;
-        provider(&parameters).map_err(|source| HintPolicyRegistryError::Provider {
-            policy_type: policy_type.to_owned(),
-            source,
-        })
+        provider(&parameters).map_err(provider_error)
     }
 
     fn available_policy_types(&self) -> String {
         let mut available = self.providers.keys().cloned().collect::<Vec<_>>();
+        available.push(KV_FETCH_HINT_POLICY_TYPE.to_owned());
         available.sort_unstable();
         available.join(", ")
     }
+}
+
+/// A request carries at most one fetch, so one role cannot run two policies that read fetch
+/// sources: their choices could conflict on every request.
+fn validate_role(policies: &[ResolvedHintPolicy]) -> Result<(), HintPolicyRegistryError> {
+    let mut fetch_policies = policies
+        .iter()
+        .filter(|policy| policy.definition.requirements.reads_kv_fetch_sources());
+    if let (Some(first), Some(second)) = (fetch_policies.next(), fetch_policies.next()) {
+        return Err(HintPolicyRegistryError::ConflictingFetchPolicies {
+            first: first.name.to_string(),
+            second: second.name.to_string(),
+        });
+    }
+    Ok(())
 }

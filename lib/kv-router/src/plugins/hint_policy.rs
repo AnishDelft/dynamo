@@ -20,6 +20,7 @@
 //! This module is experimental: names and signatures can change without a deprecation period.
 
 mod config;
+mod fetch;
 mod registry;
 pub(crate) mod runtime;
 #[cfg(test)]
@@ -29,17 +30,21 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::kv_hints::KvHintAction;
-use crate::plugins::worker_selection::{WorkerCandidates, WorkerInputs, WorkerSelectionContext};
+use crate::kv_hints::{KvHintAction, KvTransferCandidateSource};
+use crate::plugins::worker_selection::{
+    WorkerCandidate, WorkerCandidates, WorkerInputs, WorkerSelectionContext,
+};
 use crate::protocols::WorkerWithDpRank;
 
 pub(crate) use config::RawHintPolicyConfig;
 pub use config::{HintPolicyConfig, HintPolicyInstanceConfig};
+pub use fetch::{KV_FETCH_HINT_POLICY_TYPE, KvFetchHintPolicy, KvFetchHintPolicyParameters};
 pub(crate) use registry::HintPolicyRegistry;
 pub use registry::{
     HintPolicyConstructor, HintPolicyDefinition, HintPolicyFactory, HintPolicyParameters,
     HintPolicyProvider, HintPolicyProviderError, HintPolicyRegistryError,
 };
+pub use runtime::HintRequestInputs;
 pub(crate) use runtime::{ActionStage, SelectionStage};
 use runtime::{RowEffects, TypedActionStage, TypedSelectionStage};
 
@@ -75,8 +80,9 @@ pub trait HintPolicy: Send + Sync + 'static {
     /// Formulate KV actions for the selected worker after booking.
     ///
     /// `plan` is this policy's plan for the selected candidate, if its selection stage attached
-    /// one. An error with a plan fails the selection and releases its booking; an error without
-    /// one drops only this policy's actions.
+    /// one. A fetch credited through [`SelectionAdvice::fetch`] is materialized by the host and is
+    /// not repeated here. An error with a plan, or after a credited fetch, fails the selection and
+    /// releases its booking; an error without either drops only this policy's actions.
     fn formulate(
         &self,
         _context: &HintActionContext<'_>,
@@ -91,6 +97,7 @@ pub trait HintPolicy: Send + Sync + 'static {
 pub struct HintRequirements {
     selection: Option<WorkerInputs>,
     actions: bool,
+    kv_fetch_sources: bool,
 }
 
 impl HintRequirements {
@@ -99,10 +106,12 @@ impl HintRequirements {
         Self {
             selection: None,
             actions: false,
+            kv_fetch_sources: false,
         }
     }
 
-    /// Run the selection stage with these worker input groups.
+    /// Run the selection stage with these worker input groups. `KV_TRANSFER`-style fetch data is
+    /// requested separately through [`Self::with_kv_fetch_sources`].
     pub fn with_selection(mut self, inputs: WorkerInputs) -> Self {
         self.selection = Some(inputs);
         self
@@ -114,12 +123,24 @@ impl HintRequirements {
         self
     }
 
+    /// Read the host's KV fetch sources, through [`HintSelectionContext::kv_fetch_source`] and
+    /// [`HintActionContext::kv_fetch_source`]. The host retains the matched block chain for a
+    /// request only when a policy asks for it and a worker in the partition consumes router hints.
+    pub fn with_kv_fetch_sources(mut self) -> Self {
+        self.kv_fetch_sources = true;
+        self
+    }
+
     pub fn selection_inputs(&self) -> Option<WorkerInputs> {
         self.selection
     }
 
     pub fn uses_actions(&self) -> bool {
         self.actions
+    }
+
+    pub fn reads_kv_fetch_sources(&self) -> bool {
+        self.kv_fetch_sources
     }
 
     /// Requirements a host must satisfy to run every policy in a list.
@@ -130,19 +151,82 @@ impl HintRequirements {
                 (left, right) => left.or(right),
             },
             actions: self.actions || other.actions,
+            kv_fetch_sources: self.kv_fetch_sources || other.kv_fetch_sources,
         }
     }
 
-    /// Worker inputs a host must provide for these requirements. Hosts union this with the
-    /// worker-selection policy's inputs before starting indexes and subscriptions.
+    /// Worker inputs a host must provide for these requirements. Reading fetch sources needs the
+    /// KV index, so it implies [`WorkerInputs::CACHE`]. Hosts union this with the worker-selection
+    /// policy's inputs before starting indexes and subscriptions.
     pub fn worker_inputs(&self) -> WorkerInputs {
-        self.selection.unwrap_or(WorkerInputs::NONE)
+        let selection = self.selection.unwrap_or(WorkerInputs::NONE);
+        if self.kv_fetch_sources {
+            selection | WorkerInputs::CACHE
+        } else {
+            selection
+        }
+    }
+}
+
+/// A source the host's router-hint rules allow a target to fetch its KV prefix from.
+///
+/// The host checks that the source shares the target's hint worker type, has a control endpoint,
+/// is neither the target nor a cache owner attached to it, and respects the target's KV transfer
+/// island. Only the host constructs this value, for one target in one evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvFetchSource {
+    target: WorkerWithDpRank,
+    source: KvTransferCandidateSource,
+    prefix_blocks: usize,
+    local_prefix_blocks: usize,
+}
+
+impl KvFetchSource {
+    pub(crate) fn new(
+        target: WorkerWithDpRank,
+        source: KvTransferCandidateSource,
+        prefix_blocks: usize,
+        local_prefix_blocks: usize,
+    ) -> Self {
+        debug_assert!(prefix_blocks > local_prefix_blocks);
+        Self {
+            target,
+            source,
+            prefix_blocks,
+            local_prefix_blocks,
+        }
+    }
+
+    /// The worker and rank that would fetch.
+    pub fn target(&self) -> WorkerWithDpRank {
+        self.target
+    }
+
+    /// The worker or cache owner holding the prefix.
+    pub fn source(&self) -> KvTransferCandidateSource {
+        self.source
+    }
+
+    /// Root-aligned prefix the source holds, in blocks.
+    pub fn prefix_blocks(&self) -> usize {
+        self.prefix_blocks
+    }
+
+    /// The target's device and host-pinned prefix, in blocks, which the fetch would extend.
+    pub fn local_prefix_blocks(&self) -> usize {
+        self.local_prefix_blocks
+    }
+
+    /// Blocks the fetch adds beyond the target's own prefix. Always at least one.
+    pub fn additional_blocks(&self) -> usize {
+        self.prefix_blocks - self.local_prefix_blocks
     }
 }
 
 /// Request-level values available to a selection stage.
 pub struct HintSelectionContext<'a> {
     request: &'a WorkerSelectionContext<'a>,
+    fetch: Option<runtime::FetchView<'a>>,
 }
 
 impl<'a> HintSelectionContext<'a> {
@@ -150,13 +234,24 @@ impl<'a> HintSelectionContext<'a> {
     pub fn request(&self) -> &WorkerSelectionContext<'a> {
         self.request
     }
+
+    /// The source `candidate` would fetch from, for a policy that declared
+    /// [`HintRequirements::with_kv_fetch_sources`]. `None` when no eligible source holds a longer
+    /// prefix than the candidate's device and host-pinned prefix, or when the host has no fetch
+    /// data for this request.
+    pub fn kv_fetch_source(&self, candidate: WorkerCandidate<'_>) -> Option<KvFetchSource> {
+        self.fetch.as_ref()?.source_for(candidate.worker())
+    }
 }
 
 /// Write-only advice from one policy for one evaluation. Rows are the candidate rows passed to
 /// [`HintPolicy::advise_selection`].
 pub struct SelectionAdvice<'a, P> {
+    policy: usize,
     effects: &'a mut RowEffects,
     plans: &'a mut [Option<P>],
+    /// The fetch sources the host offered this evaluation, for a policy that reads them.
+    fetch: Option<runtime::FetchView<'a>>,
 }
 
 impl<P> SelectionAdvice<'_, P> {
@@ -179,6 +274,7 @@ impl<P> SelectionAdvice<'_, P> {
 
     /// Add a finite, lower-is-better contribution to a candidate's total cost, in the configured
     /// worker-selection policy's units. Contributions from several calls and policies add up.
+    /// Credit for a fetch goes through [`Self::fetch`] instead, so it cannot outlive the fetch.
     pub fn add_cost(&mut self, row: usize, cost: f64) -> Result<(), HintPolicyError> {
         self.check_row(row)?;
         if !cost.is_finite() {
@@ -195,6 +291,42 @@ impl<P> SelectionAdvice<'_, P> {
     pub fn plan(&mut self, row: usize, plan: P) -> Result<(), HintPolicyError> {
         self.check_row(row)?;
         self.plans[row] = Some(plan);
+        Ok(())
+    }
+
+    /// Commit the candidate to this fetch if it wins, and subtract `credit` from its total cost
+    /// for the blocks the fetch provides. The host attaches the matching `kv.fetch` action itself,
+    /// so the credit cannot be separated from its delivery. A zero credit commits the fetch
+    /// without favoring the candidate.
+    ///
+    /// `source` must come from [`HintSelectionContext::kv_fetch_source`] for this row, `credit`
+    /// must be finite and non-negative, and a row takes at most one fetch across all policies.
+    pub fn fetch(
+        &mut self,
+        row: usize,
+        source: KvFetchSource,
+        credit: f64,
+    ) -> Result<(), HintPolicyError> {
+        self.check_row(row)?;
+        if !credit.is_finite() || credit < 0.0 {
+            return Err(HintPolicyError::new(format!(
+                "fetch credit {credit} for candidate row {row} must be finite and non-negative"
+            )));
+        }
+        // The host materializes the fetch from this source, so it must be the one the host
+        // offered in this evaluation, not one kept from another request.
+        if self
+            .fetch
+            .as_ref()
+            .and_then(|view| view.source_for(source.target))
+            != Some(source)
+        {
+            return Err(HintPolicyError::new(format!(
+                "fetch source for candidate row {row} is not the host's current source"
+            )));
+        }
+        self.effects.fetch(self.policy, row, source)?;
+        self.effects.add_cost(row, -credit);
         Ok(())
     }
 
@@ -216,6 +348,8 @@ pub struct HintActionContext<'a> {
     worker: WorkerWithDpRank,
     prompt_tokens: usize,
     block_size: u32,
+    fetch: Option<runtime::FetchView<'a>>,
+    fetch_taken: bool,
 }
 
 impl HintActionContext<'_> {
@@ -237,6 +371,37 @@ impl HintActionContext<'_> {
     /// Tokens per KV block in this partition.
     pub fn block_size(&self) -> u32 {
         self.block_size
+    }
+
+    /// The source the selected worker would fetch from, for a policy that declared
+    /// [`HintRequirements::with_kv_fetch_sources`]. `None` when a fetch is already committed for
+    /// this request, so an action-only policy cannot add a second fetch.
+    pub fn kv_fetch_source(&self) -> Option<KvFetchSource> {
+        if self.fetch_taken {
+            return None;
+        }
+        self.fetch.as_ref()?.source_for(self.worker)
+    }
+
+    /// Format the `kv.fetch` action for a source of the selected worker. Use it for a fetch that
+    /// did not influence selection; a fetch credited during selection is attached by the host.
+    pub fn kv_fetch_action(&self, source: &KvFetchSource) -> Result<KvHintAction, HintPolicyError> {
+        if source.target != self.worker {
+            return Err(HintPolicyError::new(format!(
+                "fetch source targets worker {:?}, but the request booked {:?}",
+                source.target, self.worker
+            )));
+        }
+        // A source kept from another request may not hold this request's prefix.
+        if self.kv_fetch_source() != Some(*source) {
+            return Err(HintPolicyError::new(
+                "fetch source is not the host's current source for the booked worker",
+            ));
+        }
+        self.fetch
+            .as_ref()
+            .and_then(|fetch| fetch.action(source))
+            .ok_or_else(|| HintPolicyError::new("fetch source is no longer available"))
     }
 }
 
@@ -275,11 +440,13 @@ impl HintPolicyInstance {
                     name.clone(),
                     Arc::clone(&policy),
                     inputs,
+                    requirements.kv_fetch_sources,
                 )) as Box<dyn SelectionStage>
             }),
             // Plans always need a KV-action stage, even a policy whose `formulate` does nothing.
-            actions: (requirements.actions || requirements.selection.is_some())
-                .then(|| Arc::new(TypedActionStage::new(policy)) as Arc<dyn ActionStage>),
+            actions: (requirements.actions || requirements.selection.is_some()).then(|| {
+                Arc::new(TypedActionStage::new(policy, requirements)) as Arc<dyn ActionStage>
+            }),
             name,
             requirements,
         }
@@ -326,19 +493,30 @@ impl fmt::Debug for HintPolicyInstance {
 pub struct HintPlans {
     worker: Option<WorkerWithDpRank>,
     plans: Vec<(usize, Box<dyn Any + Send>)>,
+    fetch: Option<(usize, KvFetchSource)>,
 }
 
 impl HintPlans {
-    pub(crate) fn new(worker: WorkerWithDpRank, plans: Vec<(usize, Box<dyn Any + Send>)>) -> Self {
+    pub(crate) fn new(
+        worker: WorkerWithDpRank,
+        plans: Vec<(usize, Box<dyn Any + Send>)>,
+        fetch: Option<(usize, KvFetchSource)>,
+    ) -> Self {
         Self {
             worker: Some(worker),
             plans,
+            fetch,
         }
     }
 
-    /// Whether no policy attached a plan to the selected worker.
+    /// Whether no policy attached a plan or fetch to the selected worker.
     pub fn is_empty(&self) -> bool {
-        self.plans.is_empty()
+        self.plans.is_empty() && self.fetch.is_none()
+    }
+
+    /// The fetch committed for the selected worker, if a policy credited one.
+    pub fn fetch(&self) -> Option<KvFetchSource> {
+        self.fetch.map(|(_, source)| source)
     }
 
     pub(crate) fn worker(&self) -> Option<WorkerWithDpRank> {
@@ -348,6 +526,12 @@ impl HintPlans {
     pub(crate) fn take_plan(&mut self, policy: usize) -> Option<Box<dyn Any + Send>> {
         let index = self.plans.iter().position(|(owner, _)| *owner == policy)?;
         Some(self.plans.swap_remove(index).1)
+    }
+
+    pub(crate) fn fetch_for(&self, policy: usize) -> Option<KvFetchSource> {
+        self.fetch
+            .filter(|(owner, _)| *owner == policy)
+            .map(|(_, source)| source)
     }
 }
 
@@ -363,6 +547,7 @@ impl fmt::Debug for HintPlans {
                     .map(|(policy, _)| policy)
                     .collect::<Vec<_>>(),
             )
+            .field("fetch", &self.fetch)
             .finish()
     }
 }

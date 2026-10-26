@@ -44,10 +44,9 @@
 
 use super::super::affinity::{SessionAffinityMode, validate_dispatch_target};
 use super::super::pending::PendingHint;
-use super::hint::{
-    KV_HINT_FETCH_ACTION_ID, formulate_kv_hint, hint_capable_partition, transfer_hint_for_selection,
-};
-use crate::plugins::hint_policy::runtime::ActionInputs;
+use super::hint::formulate_kv_hint;
+use crate::plugins::hint_policy::HintRequestInputs;
+use crate::plugins::hint_policy::runtime::{ActionInputs, FetchSourceRules, FetchView};
 
 /// `try_acquire` then `join_initializing` attempts before a commit that finds
 /// the session initializing routes unpinned (see the module doc).
@@ -315,15 +314,23 @@ impl SelectionCore {
                 .map_err(affinity_error)?,
             _ => affinity_target,
         };
-        // Router hints are attached to bookings only, and only when a worker in
-        // this partition can consume them and the indexer can retain the
-        // matched chain (local, event-driven, no approximate writes).
-        // Read from the published partition snapshot, the same view the hint
-        // builder uses, rather than scanning the catalog per booking.
-        let hint_capable_workers = book && hint_capable_partition(&entry.workers_tx.borrow());
+        // Fetch sources need a hint policy that reads them, a worker in this
+        // partition that consumes router hints, and an indexer that can retain
+        // the matched chain (local, event-driven, no approximate writes).
+        // Bookings retain them for KV-action stages; other selections retain
+        // them only when a selection stage reads them, so previews score like
+        // bookings. The rules were built when the worker map was published.
+        // A preview cached for a later reservation formulates that booking's hint, so it
+        // retains fetch sources whenever a hint policy reads them.
+        let caches_for_replay = replay_id.is_some() && !book;
+        let fetch_rules = (book
+            || entry.hint_selection_reads_fetch
+            || (caches_for_replay && entry.hint_requirements.reads_kv_fetch_sources()))
+        .then(|| entry.fetch_rules.read().clone())
+        .flatten();
         let retain_kv_transfer_chain =
-            hint_capable_workers && entry.indexer.supports_kv_transfer_chain_retention();
-        if hint_capable_workers && !retain_kv_transfer_chain {
+            fetch_rules.is_some() && entry.indexer.supports_kv_transfer_chain_retention();
+        if fetch_rules.is_some() && !retain_kv_transfer_chain {
             static WARN_ONCE: std::sync::Once = std::sync::Once::new();
             WARN_ONCE.call_once(|| {
                 tracing::warn!(
@@ -417,6 +424,11 @@ impl SelectionCore {
         let booked_sequence_hashes =
             matches!(admission, SelectionAdmission::Book { .. }).then(|| sequence_hashes.clone());
         let returned_routing_hashes = return_routing_hashes.then(|| block_hashes.clone());
+        let fetch_rules = fetch_rules.filter(|_| retain_kv_transfer_chain);
+        let hint_inputs = fetch_rules
+            .clone()
+            .map(|rules| HintRequestInputs::with_fetch_rules(rules))
+            .unwrap_or_default();
         let schedule_request = ScheduleRequest {
             mode,
             token_seq: track_active_blocks.then_some(sequence_hashes),
@@ -425,6 +437,7 @@ impl SelectionCore {
             overlap,
             kv_transfer_candidates,
             retain_kv_transfer_chain,
+            hint_inputs,
             router_config_override,
             lora_name: prompt.lora_name.map(str::to_string),
             priority_jump,
@@ -484,32 +497,31 @@ impl SelectionCore {
             (Some(endpoint), total_kv_blocks)
         };
         let effective_prefill = effective_prefill_tokens(isl_tokens, response.cached_tokens);
-        let router_fetch = if retain_kv_transfer_chain && response.kv_transfer_candidates.is_some()
-        {
-            transfer_hint_for_selection(
-                &entry.workers_tx.borrow(),
-                response.best_worker,
-                response.target_cached_prefix_blocks,
-                response.kv_transfer_candidates.as_ref(),
-            )
-            .map(|payload| KvHintAction::fetch(KV_HINT_FETCH_ACTION_ID, payload))
-        } else {
-            None
-        };
         // KV hints are formulated for bookings only, after booking and before
         // the booking is handed off, so a rejected hint still frees it.
-        let kv_hint = if book {
+        let kv_hint = if book && !entry.hint_policies.is_empty() {
+            let fetch = fetch_rules
+                .as_deref()
+                .zip(response.kv_transfer_candidates.as_ref())
+                .map(|(rules, candidates)| {
+                    FetchView::for_selected(
+                        rules,
+                        candidates,
+                        response.best_worker,
+                        response.target_cached_prefix_blocks as usize,
+                    )
+                });
             let inputs = ActionInputs {
                 request_id: admission.request_id().unwrap_or_default(),
                 worker: response.best_worker,
                 prompt_tokens: isl_tokens,
                 block_size: entry.block_size,
+                fetch,
             };
             formulate_kv_hint(
                 &entry.hint_policies,
                 std::mem::take(&mut response.hint_plans),
                 &inputs,
-                router_fetch,
             )?
         } else {
             None
@@ -548,6 +560,11 @@ impl SelectionCore {
             // The reservation that replays this selection formulates the hint it planned.
             let hint = (!entry.hint_policies.is_empty()).then(|| PendingHint {
                 plans: parking_lot::Mutex::new(Some(std::mem::take(&mut response.hint_plans))),
+                candidates: response.kv_transfer_candidates.take(),
+                fetch_rules: fetch_rules
+                    .clone()
+                    .map(|rules| rules as Arc<dyn FetchSourceRules>),
+                local_prefix_blocks: response.target_cached_prefix_blocks as usize,
             });
             self.selection_cache.insert(
                 cache_id,

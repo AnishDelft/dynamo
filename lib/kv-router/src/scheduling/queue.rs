@@ -126,21 +126,11 @@ fn non_max_overlap_selection<C: WorkerConfigLike>(
 }
 
 fn target_cached_prefix_blocks(request: &SchedulingRequest, target: WorkerWithDpRank) -> u32 {
-    let device = request
+    let blocks = request
         .overlap
         .tier_overlap_blocks
-        .device
-        .get(&target)
-        .copied()
-        .unwrap_or(0);
-    let lower_tier = request
-        .overlap
-        .tier_overlap_blocks
-        .host_pinned
-        .get(&target)
-        .copied()
-        .unwrap_or(0);
-    u32::try_from(device.saturating_add(lower_tier)).unwrap_or(u32::MAX)
+        .fetch_local_prefix_blocks(target);
+    u32::try_from(blocks).unwrap_or(u32::MAX)
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -2741,6 +2731,7 @@ mod tests {
             overlap: OverlapSignals::default(),
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,
+            hint_inputs: Default::default(),
             worker_loads: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,

@@ -433,6 +433,7 @@ impl PendingRequest {
             overlap: std::mem::take(&mut self.overlap),
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,
+            hint_inputs: Default::default(),
             worker_loads,
             track_prefill_tokens: self.track_prefill_tokens,
             router_config_override: None,

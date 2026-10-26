@@ -13,7 +13,9 @@ use dynamo_tokens::SequenceHash;
 use parking_lot::Mutex;
 
 use crate::identity::RoutingPartitionId;
+use crate::kv_hints::KvTransferCandidates;
 use crate::plugins::hint_policy::HintPlans;
+use crate::plugins::hint_policy::runtime::FetchSourceRules;
 use crate::protocols::{LocalBlockHash, WorkerWithDpRank};
 
 /// How long a pending selection lives before it is evicted.
@@ -67,10 +69,14 @@ pub(super) struct PendingSelection {
     pub hint: Option<PendingHint>,
 }
 
-/// The selected worker's hint plans, for the booking that replays the selection.
+/// The selected worker's hint plans and the request inputs their KV-action stages read.
 pub(super) struct PendingHint {
     /// Taken by the booking that formulates the hint, so a selection's plans are used once.
     pub plans: Mutex<Option<HintPlans>>,
+    pub candidates: Option<KvTransferCandidates>,
+    pub fetch_rules: Option<Arc<dyn FetchSourceRules>>,
+    /// The selected worker's device and host-pinned prefix, which a fetch extends.
+    pub local_prefix_blocks: usize,
 }
 
 struct Entry {
@@ -94,6 +100,15 @@ fn entry_bytes(key: &CacheKey, selection: &PendingSelection) -> usize {
         + key.0.routing_group.len()
         + selection.lora_name.as_deref().map_or(0, str::len)
         + selection.session_id.as_deref().map_or(0, str::len)
+        + selection
+            .hint
+            .as_ref()
+            .and_then(|hint| hint.candidates.as_ref())
+            .map_or(0, |candidates| {
+                candidates.block_hashes.len() * std::mem::size_of::<u64>()
+                    + candidates.owner_prefix_blocks.len()
+                        * std::mem::size_of::<(crate::kv_hints::KvTransferCandidateSource, usize)>()
+            })
 }
 
 struct State {

@@ -719,6 +719,7 @@ mod test_support {
             },
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,
+            hint_inputs: Default::default(),
             worker_loads: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,

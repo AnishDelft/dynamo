@@ -106,6 +106,7 @@ where
             overlap,
             kv_transfer_candidates,
             retain_kv_transfer_chain,
+            hint_inputs,
             shared_cache_hits,
         } = request;
         let request = SchedulingRequest {
@@ -127,6 +128,7 @@ where
             overlap,
             kv_transfer_candidates,
             retain_kv_transfer_chain,
+            hint_inputs,
             shared_cache_hits,
             worker_loads: FxHashMap::default(),
             resp_tx,
@@ -613,6 +615,7 @@ where
             },
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,
+            hint_inputs: Default::default(),
             routing_constraints,
             router_config_override: router_config_override.cloned(),
             lora_name,
@@ -1189,6 +1192,7 @@ mod tests {
             overlap: OverlapSignals::default(),
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,
+            hint_inputs: Default::default(),
             shared_cache_hits: None,
         }
     }

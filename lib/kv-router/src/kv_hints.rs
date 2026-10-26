@@ -133,8 +133,24 @@ impl KvTransferCandidates {
     pub fn best_ranked_source<R, F>(
         &self,
         prefix_blocks_to_beat: usize,
-        mut rank: F,
+        rank: F,
     ) -> Option<(KvTransferCandidateSource, Vec<ExternalSequenceBlockHash>)>
+    where
+        R: Ord,
+        F: FnMut(KvTransferCandidateSource) -> Option<R>,
+    {
+        let (source, prefix_blocks) =
+            self.best_ranked_source_prefix(prefix_blocks_to_beat, rank)?;
+        Some((source, self.block_hashes[..prefix_blocks].to_vec()))
+    }
+
+    /// Like [`Self::best_ranked_source`], but returns the winning prefix length instead of
+    /// copying its hashes. `None` also when the winner's prefix exceeds the retained chain.
+    pub fn best_ranked_source_prefix<R, F>(
+        &self,
+        prefix_blocks_to_beat: usize,
+        mut rank: F,
+    ) -> Option<(KvTransferCandidateSource, usize)>
     where
         R: Ord,
         F: FnMut(KvTransferCandidateSource) -> Option<R>,
@@ -155,7 +171,7 @@ impl KvTransferCandidates {
                 },
             )?;
 
-        Some((source, self.block_hashes.get(..prefix_blocks)?.to_vec()))
+        (prefix_blocks <= self.block_hashes.len()).then_some((source, prefix_blocks))
     }
 }
 

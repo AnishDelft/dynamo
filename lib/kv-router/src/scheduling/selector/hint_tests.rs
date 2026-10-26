@@ -286,3 +286,142 @@ fn runtime_policy_updates_keep_hint_stages() {
     let request = base_request(64);
     assert_eq!(select(&selector, &request).unwrap().worker.worker_id, 1);
 }
+
+/// Host fetch rules that offer every target worker 9's four-block prefix.
+struct WorkerNineHoldsFourBlocks;
+
+impl crate::plugins::hint_policy::runtime::FetchSourceRules for WorkerNineHoldsFourBlocks {
+    fn source_for(
+        &self,
+        _target: WorkerWithDpRank,
+        _local_prefix_blocks: usize,
+        _candidates: &crate::kv_hints::KvTransferCandidates,
+    ) -> Option<(crate::kv_hints::KvTransferCandidateSource, usize)> {
+        Some((WorkerWithDpRank::from_worker_id(9).into(), 4))
+    }
+
+    fn payload(
+        &self,
+        _source: crate::kv_hints::KvTransferCandidateSource,
+        _prefix_blocks: usize,
+        _candidates: &crate::kv_hints::KvTransferCandidates,
+    ) -> Option<crate::kv_hints::KvSourceLocationsPayload> {
+        None
+    }
+}
+
+/// A request whose candidates can fetch worker 9's prefix.
+fn fetchable_request() -> SchedulingRequest {
+    let mut request = base_request(64);
+    request.hint_inputs = crate::plugins::hint_policy::HintRequestInputs::with_fetch_rules(
+        Arc::new(WorkerNineHoldsFourBlocks),
+    );
+    request.kv_transfer_candidates = Some(crate::kv_hints::KvTransferCandidates {
+        block_hashes: Vec::new(),
+        owner_prefix_blocks: Vec::new(),
+        routing_snapshot: None,
+    });
+    request
+}
+
+/// Commits every candidate to the host's fetch source, crediting `credit_for(worker_id)`.
+struct Fetcher {
+    credit_for: fn(u64) -> f64,
+    twice: bool,
+    /// Commit a source the host did not offer: worker 8 instead of worker 9.
+    forge: bool,
+}
+
+impl HintPolicy for Fetcher {
+    type Plan = ();
+
+    fn requirements(&self) -> HintRequirements {
+        HintRequirements::new()
+            .with_selection(WorkerInputs::NONE)
+            .with_actions()
+            .with_kv_fetch_sources()
+    }
+
+    fn advise_selection(
+        &self,
+        context: &HintSelectionContext<'_>,
+        candidates: WorkerCandidates<'_>,
+        advice: &mut SelectionAdvice<'_, ()>,
+    ) -> Result<(), HintPolicyError> {
+        for (row, candidate) in candidates.iter().enumerate() {
+            let source = if self.forge {
+                crate::plugins::hint_policy::KvFetchSource::new(
+                    candidate.worker(),
+                    WorkerWithDpRank::from_worker_id(8).into(),
+                    4,
+                    0,
+                )
+            } else {
+                context
+                    .kv_fetch_source(candidate)
+                    .expect("the host offers every candidate a source")
+            };
+            advice.fetch(row, source, (self.credit_for)(candidate.worker().worker_id))?;
+            if self.twice {
+                advice.fetch(row, source, 0.0)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn fetching(fetcher: Fetcher) -> HintSelection {
+    let stages = HintPolicyInstance::new("fetcher", fetcher).into_stages();
+    HintSelection::new(vec![(0, stages.selection.expect("selection stage"))])
+}
+
+#[test]
+fn fetch_credit_moves_selection_and_travels_with_the_winning_fetch() {
+    let request = fetchable_request();
+    // Worker 2's credit outweighs its higher base cost.
+    let result = select(
+        &policy().with_hint_selection(fetching(Fetcher {
+            credit_for: |worker_id| if worker_id == 2 { 10.0 } else { 0.0 },
+            twice: false,
+            forge: false,
+        })),
+        &request,
+    )
+    .unwrap();
+    assert_eq!(result.worker.worker_id, 2);
+    let fetch = result.hint_plans.fetch().expect("the credited fetch");
+    assert_eq!(fetch.target().worker_id, 2);
+    assert_eq!(fetch.additional_blocks(), 4);
+}
+
+#[test]
+fn fetch_rejects_bad_credit_a_second_fetch_and_a_forged_source() {
+    let request = fetchable_request();
+    for fetcher in [
+        Fetcher {
+            credit_for: |_| -1.0,
+            twice: false,
+            forge: false,
+        },
+        Fetcher {
+            credit_for: |_| f64::INFINITY,
+            twice: false,
+            forge: false,
+        },
+        Fetcher {
+            credit_for: |_| 1.0,
+            twice: true,
+            forge: false,
+        },
+        Fetcher {
+            credit_for: |_| 1.0,
+            twice: false,
+            forge: true,
+        },
+    ] {
+        let error = select(&policy().with_hint_selection(fetching(fetcher)), &request)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hint policy \"fetcher\""), "{error}");
+    }
+}

@@ -462,6 +462,18 @@ async fn unreachable_remote_indexer_is_reported_not_ready() {
     assert_eq!(error.status_code(), 503);
 }
 
+/// Hint policies running Dynamo's `kv_fetch` preset with `parameters` for every role.
+fn fetch_hints(
+    parameters: crate::plugins::hint_policy::KvFetchHintPolicyParameters,
+) -> crate::plugins::hint_policy::HintPolicyFactory {
+    crate::plugins::hint_policy::HintPolicyFactory::for_all_roles([(
+        "fetch".to_string(),
+        crate::plugins::hint_policy::KvFetchHintPolicy::definition(parameters)
+            .expect("valid fetch parameters"),
+    )])
+    .expect("one fetch policy")
+}
+
 fn host_with_hints(policies: crate::plugins::hint_policy::HintPolicyFactory) -> SelectionHost {
     SelectionHost {
         hints: HostHints {
@@ -472,11 +484,17 @@ fn host_with_hints(policies: crate::plugins::hint_policy::HintPolicyFactory) -> 
 }
 
 /// Two event-driven workers; worker 1 holds every block of an 8-token
-/// prompt. `configure` adjusts each registration before upsert.
+/// prompt. `configure` adjusts each registration before upsert. Bookings run
+/// the `kv_fetch` preset with its default, action-only parameters.
 async fn hint_fixture(
     configure: impl Fn(&mut WorkerRequest),
 ) -> (SelectionCore, Arc<SelectionEntry>, Vec<u32>) {
-    hint_fixture_with(SelectionHost::default(), None, configure).await
+    hint_fixture_with(
+        host_with_hints(fetch_hints(Default::default())),
+        None,
+        configure,
+    )
+    .await
 }
 
 async fn hint_fixture_with(
@@ -3946,7 +3964,7 @@ mod hint_policies {
     use crate::plugins::hint_policy::{
         HintActionContext, HintPlans, HintPolicy, HintPolicyDefinition, HintPolicyError,
         HintPolicyFactory, HintPolicyInstance, HintRequirements, HintSelectionContext,
-        SelectionAdvice,
+        KvFetchHintPolicyParameters, SelectionAdvice,
     };
     use crate::plugins::worker_selection::{
         WorkerCandidates, WorkerInputView, WorkerInputs, WorkerPicker, WorkerScorer,
@@ -4027,6 +4045,10 @@ mod hint_policies {
             )
             .unwrap(),
         )
+    }
+
+    fn fetch(parameters: KvFetchHintPolicyParameters) -> HintPolicyDefinition {
+        crate::plugins::hint_policy::KvFetchHintPolicy::definition(parameters).unwrap()
     }
 
     /// An action-only policy that records how often it formulates.
@@ -4152,11 +4174,90 @@ mod hint_policies {
         core.select_and_reserve(request).await.expect("reserve")
     }
 
+    fn fetch_payload(action: &KvHintAction) -> KvSourceLocationsPayload {
+        serde_json::from_value(serde_json::to_value(&action.payload).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn without_hint_policies_capable_workers_get_no_fetch() {
+        let (core, _entry, tokens) = hint_fixture_with(
+            host_with_hints(HintPolicyFactory::none()),
+            None,
+            hint_capable,
+        )
+        .await;
+        let response = reserve_pinned(&core, "to-worker-2", &tokens, 2).await;
+        assert!(response.kv_hint.is_none());
+    }
+
+    #[tokio::test]
+    async fn crediting_fetch_chooses_the_worker_and_books_the_fetch_it_credited() {
+        // Without credit, the worker holding the prefix wins and has nothing to fetch.
+        let (core, _entry, tokens) = hint_fixture_with(
+            hints(vec![("fetch", fetch(Default::default()))]),
+            overlap_policy(),
+            hint_capable,
+        )
+        .await;
+        let response = reserve(&core, "uncredited", &tokens).await;
+        assert_eq!(response.worker_id, 1);
+        assert!(response.kv_hint.is_none());
+
+        // Credit for fetching worker 1's two blocks outweighs worker 1's local reuse.
+        let crediting = KvFetchHintPolicyParameters {
+            credit_per_block: 10.0,
+            ..Default::default()
+        };
+        let (core, _entry, tokens) = hint_fixture_with(
+            hints(vec![("fetch", fetch(crediting.clone()))]),
+            overlap_policy(),
+            hint_capable,
+        )
+        .await;
+        // A preview evaluates the same credited decision but never formulates a hint.
+        let mut preview = select_request();
+        preview.prompt = prompt_of(&tokens);
+        let preview = core.select(preview).await.expect("preview");
+        assert_eq!(preview.worker_id, 2);
+        assert!(preview.kv_hint.is_none());
+
+        let response = reserve(&core, "credited", &tokens).await;
+        assert_eq!(response.worker_id, 2);
+        let hint = response.kv_hint.expect("credited fetch");
+        assert_eq!(hint.message_id, "credited");
+        assert_eq!(hint.actions.len(), 1);
+        assert_eq!(hint.actions[0].action_type, "kv.fetch");
+        // The dispatched fetch is the one credited: worker 1's whole two-block prefix.
+        let payload = fetch_payload(&hint.actions[0]);
+        assert_eq!(payload.source_control_endpoint, "tcp://worker-1:9000");
+        assert_eq!(payload.block_hashes.len(), 2);
+
+        // A gate the source cannot meet removes both the credit and the fetch.
+        let (core, _entry, tokens) = hint_fixture_with(
+            hints(vec![(
+                "fetch",
+                fetch(KvFetchHintPolicyParameters {
+                    min_additional_blocks: 3,
+                    ..crediting
+                }),
+            )]),
+            overlap_policy(),
+            hint_capable,
+        )
+        .await;
+        let response = reserve(&core, "gated", &tokens).await;
+        assert_eq!(response.worker_id, 1);
+        assert!(response.kv_hint.is_none());
+    }
+
     #[tokio::test]
     async fn bookings_compose_policies_in_order_and_previews_never_formulate() {
         let recorder = Recorder::new("record");
         let (core, _entry, tokens) = hint_fixture_with(
-            hints(vec![("record", definition(recorder.clone()))]),
+            hints(vec![
+                ("fetch", fetch(Default::default())),
+                ("record", definition(recorder.clone())),
+            ]),
             None,
             hint_capable,
         )
@@ -4188,6 +4289,7 @@ mod hint_policies {
         let duplicate = Recorder::new("record");
         let (core, _entry, tokens) = hint_fixture_with(
             hints(vec![
+                ("fetch", fetch(Default::default())),
                 ("failing", definition(failing)),
                 ("record", definition(Recorder::new("record"))),
                 ("duplicate", definition(duplicate.clone())),
@@ -4203,8 +4305,7 @@ mod hint_policies {
             .iter()
             .map(|action| action.action_id.as_str())
             .collect();
-        // The router's fetch comes first; the failed policy and the policy reusing an action
-        // ID contribute nothing.
+        // The failed policy and the policy reusing an action ID contribute nothing.
         assert_eq!(ids, ["a1", "record"]);
         assert_eq!(duplicate.calls.load(Ordering::SeqCst), 1);
     }
@@ -4283,6 +4384,38 @@ mod hint_policies {
             .collect();
         // The earlier, uncommitted policy loses the ID; the planned action is delivered.
         assert_eq!(types, ["test.plan"]);
+    }
+
+    #[tokio::test]
+    async fn replayed_reservations_book_the_fetch_their_selection_credited() {
+        let crediting = KvFetchHintPolicyParameters {
+            credit_per_block: 10.0,
+            ..Default::default()
+        };
+        let (core, _entry, tokens) = hint_fixture_with(
+            hints(vec![("fetch", fetch(crediting))]),
+            overlap_policy(),
+            hint_capable,
+        )
+        .await;
+        let mut select = select_request();
+        select.selection_id = Some("two-phase".to_string());
+        select.prompt = prompt_of(&tokens);
+        let selected = core.select(select).await.expect("select");
+        assert_eq!(selected.worker_id, 2);
+        assert!(selected.kv_hint.is_none());
+
+        let reserved = core
+            .create_reservation(replay_reservation("two-phase"))
+            .await
+            .expect("reserve");
+        assert_eq!(reserved.worker_id, 2);
+        let hint = reserved.kv_hint.expect("the fetch the selection credited");
+        assert_eq!(hint.message_id, "two-phase");
+        let payload = fetch_payload(&hint.actions[0]);
+        assert_eq!(payload.source_control_endpoint, "tcp://worker-1:9000");
+        assert_eq!(payload.block_hashes.len(), 2);
+        core.free_reservation("two-phase").await.unwrap();
     }
 
     #[tokio::test]
@@ -4428,26 +4561,20 @@ mod hint_policies {
     }
 
     #[test]
-    fn the_router_fetch_keeps_its_id_and_committed_output_is_never_crowded_out() {
+    fn the_fetch_id_is_reserved_and_committed_output_is_never_crowded_out() {
         let worker = WorkerWithDpRank::new(1, 0);
         let inputs = ActionInputs {
             request_id: "composed",
             worker,
             prompt_tokens: 8,
             block_size: 4,
+            fetch: None,
         };
-        let router_fetch = KvHintAction::fetch(
-            "a1",
-            KvSourceLocationsPayload {
-                source_control_endpoint: "tcp://worker-2:9000".to_string(),
-                block_hashes: vec![crate::protocols::ExternalSequenceBlockHash(7)],
-            },
-        );
         let policies = [
             // A non-fetch action may not take the router's fetch ID.
             slot("reuses_fetch_id", Recorder::new("a1")),
             // Uncommitted output that would overflow the hint once the plan is in.
-            slot("burst", Burst(31)),
+            slot("burst", Burst(32)),
             slot(
                 "planner",
                 Planner {
@@ -4462,18 +4589,17 @@ mod hint_policies {
                 2,
                 Box::new((worker.worker_id, 8usize)) as Box<dyn std::any::Any + Send>,
             )],
+            None,
         );
-        let hint =
-            super::super::hint::formulate_kv_hint(&policies, plans, &inputs, Some(router_fetch))
-                .unwrap()
-                .expect("composed hint");
+        let hint = super::super::hint::formulate_kv_hint(&policies, plans, &inputs)
+            .unwrap()
+            .expect("composed hint");
         let ids: Vec<_> = hint
             .actions
             .iter()
             .map(|action| action.action_id.as_str())
             .collect();
-        assert_eq!(ids, ["a1", "plan"]);
-        assert_eq!(hint.actions[0].action_type, "kv.fetch");
+        assert_eq!(ids, ["plan"]);
     }
 
     #[tokio::test]
@@ -4519,12 +4645,12 @@ mod hint_policies {
             worker: WorkerWithDpRank::new(2, 0),
             prompt_tokens: 8,
             block_size: 4,
+            fetch: None,
         };
         let error = super::super::hint::formulate_kv_hint(
             &[],
-            HintPlans::new(WorkerWithDpRank::new(1, 0), Vec::new()),
+            HintPlans::new(WorkerWithDpRank::new(1, 0), Vec::new(), None),
             &inputs,
-            None,
         )
         .unwrap_err();
         assert!(matches!(error, SelectionError::Internal(_)), "{error:?}");

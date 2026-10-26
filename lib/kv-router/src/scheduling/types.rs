@@ -13,7 +13,7 @@ use super::filter::RoutingEligibility;
 use super::overlap::{OverlapSignals, SelectedWorkerTierSnapshot};
 use super::prefill_load::effective_prefill_tokens;
 use crate::kv_hints::KvTransferCandidates;
-use crate::plugins::hint_policy::HintPlans;
+use crate::plugins::hint_policy::{HintPlans, HintRequestInputs};
 pub use crate::protocols::PotentialLoad;
 use crate::protocols::{
     LocalBlockHash, RoutingConstraints, SelectionTrace, SharedCacheHits, WorkerAffinityTarget,
@@ -84,6 +84,16 @@ pub struct TierOverlapBlocks {
     pub host_pinned: FxHashMap<WorkerWithDpRank, usize>,
     #[serde(default)]
     pub disk: FxHashMap<WorkerWithDpRank, usize>,
+}
+
+impl TierOverlapBlocks {
+    /// The prefix a KV fetch would extend on `worker`: its device and host-pinned overlap, in
+    /// blocks. Disk is not counted.
+    pub(crate) fn fetch_local_prefix_blocks(&self, worker: WorkerWithDpRank) -> usize {
+        let device = self.device.get(&worker).copied().unwrap_or(0);
+        let host_pinned = self.host_pinned.get(&worker).copied().unwrap_or(0);
+        device.saturating_add(host_pinned)
+    }
 }
 
 /// Downstream matches must include a wildcard arm because this enum is non-exhaustive.
@@ -422,6 +432,8 @@ pub struct ScheduleRequest {
     pub overlap: OverlapSignals,
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
     pub retain_kv_transfer_chain: bool,
+    /// Inputs the selection core prepared for hint policies outside the scheduler actor.
+    pub hint_inputs: HintRequestInputs,
     pub shared_cache_hits: Option<SharedCacheHits>,
 }
 
@@ -456,6 +468,8 @@ pub struct SchedulingRequest {
     pub overlap: OverlapSignals,
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
     pub retain_kv_transfer_chain: bool,
+    /// Inputs the selection core prepared for hint policies outside the scheduler actor.
+    pub hint_inputs: HintRequestInputs,
     pub shared_cache_hits: Option<SharedCacheHits>,
 
     // Load state computed during admission.
@@ -663,6 +677,7 @@ mod tests {
             },
             kv_transfer_candidates: None,
             retain_kv_transfer_chain: false,
+            hint_inputs: Default::default(),
             shared_cache_hits: None,
             worker_loads,
             resp_tx: None,

@@ -166,6 +166,7 @@ impl RouterPluginRegistry {
     }
 
     /// Register a hint-policy type, a peer of worker-selection and request-classifier plugins.
+    /// The type name `kv_fetch` is reserved for Dynamo's fetch preset.
     pub fn register_hint_policy(
         &mut self,
         name: impl Into<String>,

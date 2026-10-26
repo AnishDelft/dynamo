@@ -225,7 +225,7 @@ fn resolution_reports_unknown_types_and_invalid_parameters() {
     let error = registry.resolve_hint_policies(&config).err().unwrap();
     assert!(
         matches!(&error, HintPolicyRegistryError::UnknownType { available, .. }
-            if available == "action_only, strict"),
+            if available == "action_only, kv_fetch, strict"),
         "{error}"
     );
 
@@ -290,4 +290,99 @@ fn instances_must_keep_their_declared_requirements() {
         ),
         Err(HintPolicyRegistryError::RequirementsChanged { .. })
     ));
+}
+
+#[test]
+fn registry_reserves_the_fetch_preset_type() {
+    let mut registry = RouterPluginRegistry::default();
+    assert!(matches!(
+        registry.register_hint_policy(KV_FETCH_HINT_POLICY_TYPE, action_only_provider()),
+        Err(HintPolicyRegistryError::Reserved { .. })
+    ));
+}
+
+#[test]
+fn fetch_preset_validates_its_parameters() {
+    for parameters in [
+        "{credit_per_block: -1.0}",
+        "{min_additional_blocks: 0}",
+        "{unknown: 1}",
+    ] {
+        let (config, _file) = config_with(&format!(
+            "hint_policies:\n  aggregated: [fetch]\n  instances:\n    - name: fetch\n      type: kv_fetch\n      parameters: {parameters}\n"
+        ));
+        assert!(
+            matches!(
+                RouterPluginRegistry::default().resolve_hint_policies(&config),
+                Err(HintPolicyRegistryError::Provider { .. })
+            ),
+            "{parameters}"
+        );
+    }
+}
+
+#[test]
+fn fetch_policies_start_the_kv_index() {
+    let (config, _file) = config_with(
+        r#"
+hint_policies:
+  aggregated: [crediting_fetch]
+  prefill: [fetch]
+  instances:
+    - name: crediting_fetch
+      type: kv_fetch
+      parameters:
+        credit_per_block: 0.5
+    - name: fetch
+      type: kv_fetch
+"#,
+    );
+    let factory = RouterPluginRegistry::default()
+        .resolve_hint_policies(&config)
+        .unwrap();
+    // A crediting fetch policy runs in selection and reads cache inputs.
+    let requirements = factory.requirements(WorkerType::Aggregated);
+    assert_eq!(requirements.selection_inputs(), Some(WorkerInputs::CACHE));
+    assert!(requirements.reads_kv_fetch_sources());
+    // An action-only fetch still reads fetch sources, so it starts the KV index too.
+    let requirements = factory.requirements(WorkerType::Prefill);
+    assert_eq!(requirements.selection_inputs(), None);
+    assert_eq!(requirements.worker_inputs(), WorkerInputs::CACHE);
+}
+
+#[test]
+fn a_role_runs_at_most_one_fetch_reading_policy() {
+    let (config, _file) = config_with(
+        r#"
+hint_policies:
+  aggregated: [fetch, crediting_fetch]
+  instances:
+    - name: fetch
+      type: kv_fetch
+    - name: crediting_fetch
+      type: kv_fetch
+      parameters:
+        credit_per_block: 1.0
+"#,
+    );
+    assert!(matches!(
+        RouterPluginRegistry::default().resolve_hint_policies(&config),
+        Err(HintPolicyRegistryError::ConflictingFetchPolicies { .. })
+    ));
+}
+
+#[test]
+fn fetch_preset_runs_in_selection_only_when_it_credits() {
+    let action_only = KvFetchHintPolicy::new(KvFetchHintPolicyParameters::default()).unwrap();
+    assert_eq!(action_only.requirements().selection_inputs(), None);
+    let crediting = KvFetchHintPolicy::new(KvFetchHintPolicyParameters {
+        credit_per_block: 1.0,
+        ..KvFetchHintPolicyParameters::default()
+    })
+    .unwrap();
+    assert_eq!(
+        crediting.requirements().selection_inputs(),
+        Some(WorkerInputs::CACHE)
+    );
+    assert!(crediting.requirements().uses_actions());
 }

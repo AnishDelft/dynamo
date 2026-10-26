@@ -17,7 +17,7 @@ use crate::scheduling::config::KvRouterConfig;
 use crate::scheduling::filter::RoutingEligibility;
 use crate::scheduling::types::{KvSchedulerError, SchedulingRequest, WorkerSelectionPolicyError};
 
-use crate::plugins::hint_policy::runtime::HintSelection;
+use crate::plugins::hint_policy::runtime::{FetchView, HintSelection};
 use crate::plugins::worker_selection::{
     CacheSnapshot, CandidateData, ScoredWorkerCandidate, WorkerCacheData, WorkerCandidate,
     WorkerCandidates, WorkerFilter, WorkerInputs, WorkerLoadInput, WorkerPicker, WorkerScorer,
@@ -349,14 +349,31 @@ impl ComposedPolicyState {
     fn advise_and_score(
         &mut self,
         input: &MaterializedSelectionInput<'_>,
+        request: &SchedulingRequest,
     ) -> Result<(), KvSchedulerError> {
         if let Some(hints) = self.hints.as_mut()
             && !self.unscored_candidates.is_empty()
         {
+            let fetch = if hints.reads_kv_fetch_sources() {
+                request
+                    .hint_inputs
+                    .fetch_rules()
+                    .zip(request.kv_transfer_candidates.as_ref())
+                    .map(|(rules, candidates)| {
+                        FetchView::for_selection(
+                            rules,
+                            candidates,
+                            &request.overlap.tier_overlap_blocks,
+                        )
+                    })
+            } else {
+                None
+            };
             hints.advise(
                 &input.context,
                 &self.unscored_candidates,
                 &input.cache_snapshot,
+                fetch,
             )?;
             if let Some(keep) = hints.kept_rows() {
                 retain_rows(&mut self.unscored_candidates, keep);
@@ -431,7 +448,7 @@ pub(super) fn collect_policy_candidates<C: WorkerConfigLike>(
             false
         });
         let has_eligible_worker = !state.candidates.is_empty();
-        state.advise_and_score(input)?;
+        state.advise_and_score(input, request)?;
         return Ok(has_eligible_worker);
     }
 
@@ -490,7 +507,7 @@ pub(super) fn collect_policy_candidates<C: WorkerConfigLike>(
     if let Some(error) = error {
         return Err(error);
     }
-    state.advise_and_score(input)?;
+    state.advise_and_score(input, request)?;
     Ok(has_eligible_worker)
 }
 

@@ -361,6 +361,7 @@ impl KvReplayRouter {
                 overlap,
                 kv_transfer_candidates: None,
                 retain_kv_transfer_chain: false,
+                hint_inputs: Default::default(),
                 routing_constraints: RoutingConstraints::default(),
                 router_config_override: None,
                 lora_name: None,

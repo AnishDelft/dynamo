@@ -25,7 +25,7 @@ use crate::indexer::{
 use crate::kv_hints::{
     KvHint, KvHintAction, KvSourceLocationsPayload, KvTransferCandidateSource, KvTransferCandidates,
 };
-use crate::plugins::hint_policy::HintPolicyFactory;
+use crate::plugins::hint_policy::{HintPolicyFactory, HintRequirements};
 use crate::protocols::{
     LocalBlockHash, PrefillLoadHint, SharedCacheHits, WorkerAffinityTarget, WorkerConfigLike,
     WorkerId, WorkerWithDpRank,
@@ -61,7 +61,7 @@ mod run;
 mod tests;
 mod workers;
 
-use hint::HintPolicySlot;
+use hint::{HintPolicySlot, PartitionFetchRules};
 use reservations::ReservationIndex;
 
 pub use operation::{
@@ -134,9 +134,38 @@ struct SelectionEntry {
     /// This partition's hint policies in configured order; their selection stages run inside
     /// `scheduler`'s worker-selection policy.
     hint_policies: Vec<HintPolicySlot>,
+    hint_requirements: HintRequirements,
+    /// Whether a selection stage reads fetch sources, so previews must retain them too.
+    hint_selection_reads_fetch: bool,
+    /// Fetch-source rules over the published workers; `None` when no worker consumes router hints
+    /// or no hint policy reads fetch sources.
+    fetch_rules: RwLock<Option<Arc<PartitionFetchRules>>>,
 }
 
 impl SelectionEntry {
+    /// Rebuild the fetch-source rules from the published worker map.
+    fn refresh_fetch_rules(&self) {
+        let workers = self.workers_tx.borrow();
+        let rules = if self.hint_requirements.reads_kv_fetch_sources() {
+            PartitionFetchRules::for_partition(&workers).map(Arc::new)
+        } else {
+            // Router fetch hints are opt-in; say so once to deployments that relied on them.
+            if hint::hint_capable_partition(&workers) {
+                static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                WARN_ONCE.call_once(|| {
+                    tracing::warn!(
+                        "Workers consume router KV hints, but no hint policy reads KV fetch \
+                         sources, so the router sends no kv.fetch hints; configure the kv_fetch \
+                         hint policy to send them"
+                    );
+                });
+            }
+            None
+        };
+        drop(workers);
+        *self.fetch_rules.write() = rules;
+    }
+
     fn session_affinity(
         &self,
         config: SessionAffinityConfig,

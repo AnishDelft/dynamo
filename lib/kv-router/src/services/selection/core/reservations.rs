@@ -7,7 +7,7 @@
 
 use super::hint::formulate_kv_hint;
 use super::*;
-use crate::plugins::hint_policy::runtime::ActionInputs;
+use crate::plugins::hint_policy::runtime::{ActionInputs, FetchView};
 use crate::scheduling::queue::BookingHandle;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -447,8 +447,20 @@ impl SelectionCore {
                     worker,
                     prompt_tokens: pending.isl_tokens,
                     block_size: entry.block_size,
+                    fetch: hint
+                        .fetch_rules
+                        .as_deref()
+                        .zip(hint.candidates.as_ref())
+                        .map(|(rules, candidates)| {
+                            FetchView::for_selected(
+                                rules,
+                                candidates,
+                                worker,
+                                hint.local_prefix_blocks,
+                            )
+                        }),
                 };
-                formulate_kv_hint(&entry.hint_policies, plans, &inputs, None)?
+                formulate_kv_hint(&entry.hint_policies, plans, &inputs)?
             }
             None => None,
         };

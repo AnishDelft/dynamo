@@ -347,8 +347,12 @@ impl SelectionCore {
                 );
                 let PartitionHints {
                     policies: hint_policies,
+                    requirements: hint_requirements,
                     selection: hint_selection,
                 } = hints;
+                let hint_selection_reads_fetch = hint_selection
+                    .as_ref()
+                    .is_some_and(HintSelection::reads_kv_fetch_sources);
                 let selector = match hint_selection {
                     Some(hint_selection) => selector.with_hint_selection(hint_selection),
                     None => selector,
@@ -386,6 +390,9 @@ impl SelectionCore {
                     affinity: OnceCell::new(),
                     replica_config: self.replica_config.clone(),
                     hint_policies,
+                    hint_requirements,
+                    hint_selection_reads_fetch,
+                    fetch_rules: RwLock::new(None),
                 }))
             })?
             .clone();
@@ -433,9 +440,11 @@ impl SelectionCore {
         let instances = factory
             .instances(&self.kv_router_config, self.worker_type, key.as_ref())
             .map_err(|error| SelectionError::Internal(error.to_string()))?;
+        let mut requirements = HintRequirements::new();
         let mut policies = Vec::with_capacity(instances.len());
         let mut stages = Vec::new();
         for (index, instance) in instances.into_iter().enumerate() {
+            requirements = requirements.union(instance.requirements());
             let stages_of = instance.into_stages();
             if let Some(stage) = stages_of.selection {
                 stages.push((index, stage));
@@ -447,6 +456,7 @@ impl SelectionCore {
         }
         Ok(PartitionHints {
             policies,
+            requirements,
             selection: (!stages.is_empty()).then(|| HintSelection::new(stages)),
         })
     }
@@ -467,6 +477,7 @@ impl SelectionCore {
             }
         });
         if modified {
+            entry.refresh_fetch_rules();
             entry.scheduler.apply_published_worker_configs();
             #[cfg(test)]
             self.publish_count.fetch_add(1, Ordering::SeqCst);
@@ -477,5 +488,6 @@ impl SelectionCore {
 /// A partition's constructed hint policies.
 struct PartitionHints {
     policies: Vec<HintPolicySlot>,
+    requirements: HintRequirements,
     selection: Option<HintSelection>,
 }
