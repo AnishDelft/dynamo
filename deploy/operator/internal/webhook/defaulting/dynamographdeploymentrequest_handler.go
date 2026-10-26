@@ -131,7 +131,7 @@ func (d *DGDRDefaulter) Default(ctx context.Context, obj runtime.Object) error {
 	// Image derivation remains create-only so updates do not rewrite an
 	// intentionally cleared image.
 	if req.Operation == admissionv1.Create && dgdr.Spec.Image == "" {
-		if img := defaultPlannerImageFor(d.OperatorVersion, d.DefaultImage); img != "" {
+		if img := PlannerImageFor(d.OperatorVersion, d.DefaultImage); img != "" {
 			dgdr.Spec.Image = img
 			logger.Info("defaulted spec.image from operator version",
 				"name", dgdr.Name,
@@ -144,9 +144,10 @@ func (d *DGDRDefaulter) Default(ctx context.Context, obj runtime.Object) error {
 	return nil
 }
 
-// defaultPlannerImageFor returns explicitImage when set, else the planner image with a
-// canonical operator-version tag, or an empty string when the version cannot be parsed.
-func defaultPlannerImageFor(operatorVersion, explicitImage string) string {
+// PlannerImageFor returns explicitImage when set, else the planner image with a canonical
+// operator-version tag, or an empty string when the version cannot be parsed. The same resolved
+// image defaults v1beta1 Requests and executes v1beta2 Runs.
+func PlannerImageFor(operatorVersion, explicitImage string) string {
 	if explicitImage != "" {
 		return explicitImage
 	}
