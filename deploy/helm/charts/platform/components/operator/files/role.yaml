@@ -299,11 +299,20 @@ rules:
   - dynamographdeployments/status
   - dynamographdeploymentscalingadapters/status
   - dynamomodels/status
+  - dynamopoolrelays/status
   - lpxgraphdeployments/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - nvidia.com
+  resources:
+  - dynamopoolrelays
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - nvidia.com
   resources:
