@@ -1215,7 +1215,7 @@ func (v *sharedValidation) validateDynamoComponentDeploymentSharedSpecUpdate(
 			allErrs = append(allErrs, field.Required(imagePath, "is required"))
 		} else if !v.toleratesMissingRuntimeVersionOverride(string(newComponent.ComponentType)) &&
 			runtimeVersionOverrideRequired(newImage, newComponent.RuntimeVersionOverride) &&
-			(newImage != oldImage || overrideChanged) {
+			(newImage != oldImage || overrideChanged || newComponent.ComponentType != oldComponent.ComponentType) {
 			allErrs = append(allErrs, field.Required(
 				fldPath.Child("runtimeVersionOverride"),
 				runtimeVersionOverrideRequiredMessage,
@@ -1251,7 +1251,8 @@ func (v *sharedValidation) validateRolePodTemplateRuntimeVersionUpdate(
 		role := &newComponent.Roles[i]
 		newImage := rolePodTemplateMainImage(role)
 		if newImage != "" && runtimeVersionOverrideRequired(newImage, newComponent.RuntimeVersionOverride) &&
-			(newImage != oldImages[role.Name] || newComponent.RuntimeVersionOverride != oldComponent.RuntimeVersionOverride) {
+			(newImage != oldImages[role.Name] || newComponent.RuntimeVersionOverride != oldComponent.RuntimeVersionOverride ||
+				newComponent.ComponentType != oldComponent.ComponentType) {
 			return field.ErrorList{field.Required(
 				fldPath.Child("runtimeVersionOverride"),
 				runtimeVersionOverrideRequiredMessage,
