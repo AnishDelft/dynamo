@@ -123,7 +123,7 @@ These fields are shared between a standalone DCD and each entry of a DGD `spec.c
 </ParamField>
 
 <ParamField path="podTemplate" type="core/v1.PodTemplateSpec">
-  Complete Pod template shared by all roles of the component. It is mutually exclusive with `roles[*].podTemplate`. Every component must include `spec.podTemplate.spec.containers[name=main]` with a non-empty `image`. By default the operator injects command, environment, port, probe, resource, and volume-mount defaults into `spec.podTemplate.spec.containers[name=main]`, merging your overrides by name. Declaring `spec.podTemplate.spec.initContainers[name=runtime]` activates [Dynamo Sidecar Mode](#dynamo-sidecar-mode). Existing standard-mode components created without `spec.podTemplate.spec.containers[name=main].image` may retain that omission on unrelated updates. For DGD components whose runtime image has no parseable semantic-version tag, set `runtimeVersionOverride`. Other containers are user-managed and must specify their required fields, including `image`; `frontendSidecar` can explicitly select a regular container for frontend defaults. Replaces the ten separate per-component fields (`resources`, `envs`, `livenessProbe`, and so on) that existed in `v1alpha1`.
+  Complete Pod template shared by all roles of the component. It is mutually exclusive with `roles[*].podTemplate`. Every component must include `spec.podTemplate.spec.containers[name=main]` with a non-empty `image`. By default the operator injects command, environment, port, probe, resource, and volume-mount defaults into `spec.podTemplate.spec.containers[name=main]`, merging your overrides by name. Declaring `spec.podTemplate.spec.initContainers[name=runtime]` activates [Dynamo Sidecar Mode](#dynamo-sidecar-mode). Existing standard-mode components created without `spec.podTemplate.spec.containers[name=main].image` may retain that omission on unrelated updates. For DGD components with a Dynamo role whose runtime image has no parseable semantic-version tag, set `runtimeVersionOverride`; components without a type do not require it. See [Runtime Version Compatibility](#runtime-version-compatibility). Other containers are user-managed and must specify their required fields, including `image`; `frontendSidecar` can explicitly select a regular container for frontend defaults. Replaces the ten separate per-component fields (`resources`, `envs`, `livenessProbe`, and so on) that existed in `v1alpha1`.
 
   For `type: frontend`, a non-empty `main.command` replaces the default frontend invocation. Only the supplied `main.args` are passed to that command; omitted or empty `args` produce no arguments. The same rule applies to the container selected by `frontendSidecar`. Other component types retain their generated arguments when an authored command omits `args` or sets `args: []`, including legacy Go EPP components with `eppConfig`.
 
@@ -302,7 +302,30 @@ Set the engine launch configuration and sidecar command for your backend. See th
 
 ## Runtime Version Compatibility
 
-DGD admission requires `runtimeVersionOverride` for non-LPX components when the runtime image has no parseable semantic-version tag. The runtime image is `spec.components[*].podTemplate.spec.initContainers[name=runtime].image` in Dynamo sidecar mode, or `spec.components[*].podTemplate.spec.containers[name=main].image` otherwise. Also set it when a parseable tag does not represent the Dynamo runtime version in the image. The override must describe the Dynamo runtime actually contained in the image.
+For DGD components with `type: frontend`, `worker`, `prefill`, `decode`, `planner`, or `epp`, admission requires `runtimeVersionOverride` when the runtime image has no parseable semantic-version tag. The runtime image is `spec.components[*].podTemplate.spec.initContainers[name=runtime].image` in Dynamo sidecar mode, or `spec.components[*].podTemplate.spec.containers[name=main].image` otherwise. Also set it when a parseable tag does not represent the Dynamo runtime version in the image. The override must describe the Dynamo runtime actually contained in the image.
+
+Components without a `type` and custom `v1alpha1` helper types do not require `runtimeVersionOverride`. LPX retains its exemption. No Dynamo runtime version is defaulted for these helpers; an image is still required, and an explicitly supplied override must satisfy its format constraints. For example, this DGD helper is valid without an override:
+
+```yaml
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: helper-example
+spec:
+  components:
+    - name: helper
+      podTemplate:
+        spec:
+          containers:
+            - name: main
+              image: busybox:latest
+              command: ["sh", "-c"]
+              args: ["while true; do sleep 30; done"]
+```
+
+If an untyped component is later assigned a Dynamo role, admission revalidates its runtime version even when the image and override are unchanged. With the image above, adding `type: worker` without a valid `runtimeVersionOverride` is rejected. Existing manifests remain valid, and the helper exemption requires no migration or rollout.
+
+Standalone DCDs retain their allowance for an unresolved runtime version except for `type: epp`, which always requires a resolvable version to validate its EPP configuration contract.
 
 When updating an image to a different Dynamo runtime version, update any configured `runtimeVersionOverride` in the same change, or remove it if the new image tag correctly identifies the runtime version. The operator uses the resolved runtime version to select feature gates that control how it renders the component's PodSpec, including flags, environment variables, and probes. For Dynamo 1.5.0 and later, changing the override alone may change the rendered PodSpec or worker revision and trigger a rollout, even when the image reference is unchanged. Keep the override aligned with the Dynamo runtime actually contained in the image.
 
