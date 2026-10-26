@@ -198,9 +198,9 @@ func (r *DynamoGraphDeploymentRequestV1beta2Reconciler) Reconcile(
 	return result, nil
 }
 
-// buildRun freezes the accepted Request input into an immutable Run spec. The Run reconciler lowers
-// this snapshot once, records the effective public recommendation input in status.aisimulate.input,
-// and passes that same document to the Job.
+// buildRun snapshots the admitted typed input into an immutable Run. Admission has already
+// persisted Request defaults and discovered hardware. The Run controller lowers this snapshot once,
+// applies inputOverrides last, and records the exact effective input in status.aisimulate.input.
 func (r *DynamoGraphDeploymentRequestV1beta2Reconciler) buildRun(
 	request *nvidiacomv1beta2.DynamoGraphDeploymentRequest,
 ) (*nvidiacomv1beta2.DynamoGraphDeploymentRun, error) {
