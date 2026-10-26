@@ -5,7 +5,9 @@
 //! `create_reservation` replay path, and the lifecycle calls that advance or
 //! release them.
 
+use super::hint::formulate_kv_hint;
 use super::*;
+use crate::plugins::hint_policy::runtime::ActionInputs;
 use crate::scheduling::queue::BookingHandle;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -25,6 +27,8 @@ struct ReservationBooking {
     /// Public block hashes to record into an approximate indexer once booked.
     routing_hashes: Option<Vec<LocalBlockHash>>,
     session_id: Option<String>,
+    /// The replayed selection whose planned KV hint this booking formulates.
+    hint_source: Option<Arc<PendingSelection>>,
 }
 
 /// `selection_id` -> the booking it holds.
@@ -209,6 +213,15 @@ impl SelectionCore {
                 req.selection_id
             )));
         };
+        let hint_plans_taken = {
+            let pending = Arc::clone(&pending);
+            move || {
+                pending
+                    .hint
+                    .as_ref()
+                    .is_some_and(|hint| hint.plans.lock().is_none())
+            }
+        };
         let response = match self.book_cached_selection(pending, &req).await {
             Ok(response) => response,
             // The session moved: the cached worker can never be booked for it.
@@ -216,6 +229,13 @@ impl SelectionCore {
                 self.selection_cache
                     .remove(&key, &req.selection_id, generation);
                 return Err(SelectionError::BadRequest(message));
+            }
+            // A failed or repeated hint formulation used the selection's plans; a replay would
+            // book without them, so the selection is consumed.
+            Err(error) if hint_plans_taken() => {
+                self.selection_cache
+                    .remove(&key, &req.selection_id, generation);
+                return Err(error);
             }
             Err(error) => return Err(error),
         };
@@ -247,6 +267,7 @@ impl SelectionCore {
                 lora_name: pending.lora_name.clone(),
                 routing_hashes: pending.routing_hashes.clone(),
                 session_id: pending.session_id.clone(),
+                hint_source: pending.hint.is_some().then(|| Arc::clone(&pending)),
             },
         )
         .await
@@ -355,6 +376,8 @@ impl SelectionCore {
                 lora_name: req.prompt.lora_name,
                 routing_hashes,
                 session_id: None,
+                // An explicit reservation skips selection, so no hint policy planned for it.
+                hint_source: None,
             },
         )
         .await
@@ -380,6 +403,7 @@ impl SelectionCore {
             lora_name,
             routing_hashes,
             session_id,
+            hint_source,
         } = booking;
 
         let claim = self.claim_reservation(&selection_id, &key)?;
@@ -406,6 +430,28 @@ impl SelectionCore {
                 worker,
                 lora_name,
             })?;
+        // Formulate before the session commits or the booking installs, so a rejected hint
+        // frees both.
+        let kv_hint = match hint_source.as_deref() {
+            Some(pending) => {
+                let hint = pending.hint.as_ref().expect("hint sources carry a hint");
+                // Another attempt took the plans, so this selection was already used. Booking it
+                // without them would drop what selection planned.
+                let Some(plans) = hint.plans.lock().take() else {
+                    return Err(SelectionError::NotFound(format!(
+                        "pending selection {selection_id} was already used"
+                    )));
+                };
+                let inputs = ActionInputs {
+                    request_id: &selection_id,
+                    worker,
+                    prompt_tokens: pending.isl_tokens,
+                    block_size: entry.block_size,
+                };
+                formulate_kv_hint(&entry.hint_policies, plans, &inputs, None)?
+            }
+            None => None,
+        };
         let affinity_lease = match session {
             Some((table, session_id, hold)) => {
                 self.commit_session(table, hold, session_id, worker, &key)?
@@ -424,6 +470,7 @@ impl SelectionCore {
             worker_id: worker.worker_id,
             dp_rank: worker.dp_rank,
             endpoint,
+            kv_hint,
         })
     }
 

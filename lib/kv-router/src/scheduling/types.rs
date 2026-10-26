@@ -13,6 +13,7 @@ use super::filter::RoutingEligibility;
 use super::overlap::{OverlapSignals, SelectedWorkerTierSnapshot};
 use super::prefill_load::effective_prefill_tokens;
 use crate::kv_hints::{KvTransferCandidates, KvTransferSourceChoice};
+use crate::plugins::hint_policy::HintPlans;
 pub use crate::protocols::PotentialLoad;
 use crate::protocols::{
     LocalBlockHash, RoutingConstraints, SelectionTrace, SharedCacheHits, WorkerAffinityTarget,
@@ -162,6 +163,8 @@ pub struct SchedulingResponse {
     /// [`crate::protocols::WorkerSelectionResult::kv_transfer_source`].
     pub kv_transfer_source: Option<KvTransferSourceChoice>,
     pub kv_transfer_candidates: Option<KvTransferCandidates>,
+    /// The selected worker's hint-policy plans, if any policy planned for it.
+    pub hint_plans: HintPlans,
     pub potential_decode_blocks: usize,
     /// Per-candidate costs, present only when the scheduler has a selection
     /// trace spec installed and this selection was admitted.

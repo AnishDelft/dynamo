@@ -6,6 +6,8 @@ use std::{
     collections::HashMap,
 };
 
+#[cfg(test)]
+mod hint_tests;
 mod policy;
 #[cfg(any(test, feature = "bench"))]
 mod reference;
@@ -25,6 +27,7 @@ use reference::{DefaultWorkerPicker, DefaultWorkerScorer};
 use crate::kv_hints::{
     KvTransferScope, KvTransferSourceChoice, KvTransferSourceSummary, KvTransferTarget,
 };
+use crate::plugins::hint_policy::HintPlans;
 use crate::plugins::worker_selection::{
     CacheSnapshot, CandidateData, WorkerCacheData, WorkerTransferInput,
 };
@@ -273,6 +276,16 @@ impl<'a> MaterializedSelectionInput<'a> {
         }
     }
 
+    /// Recount the best eligible cache reuse over the rows left after hint-policy exclusions.
+    fn retrack_kept_candidates(&self, workers: impl Iterator<Item = WorkerWithDpRank>) {
+        if self.max_raw_cached_tokens.get().is_some() {
+            self.max_raw_cached_tokens.set(Some(0));
+            for worker in workers {
+                self.track_kept_candidate(worker);
+            }
+        }
+    }
+
     #[inline(always)]
     fn row(
         &self,
@@ -377,6 +390,7 @@ fn selection_result(
     block_size: u32,
     max_raw_cached_tokens: Option<usize>,
     kv_transfer_source: Option<KvTransferSourceChoice>,
+    hint_plans: HintPlans,
 ) -> WorkerSelectionResult {
     WorkerSelectionResult {
         worker,
@@ -389,6 +403,7 @@ fn selection_result(
         potential_decode_blocks: request
             .potential_decode_blocks_after_admission(worker, block_size),
         kv_transfer_source,
+        hint_plans,
     }
 }
 
@@ -570,7 +585,7 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                 worker_type,
             };
             pick_default_worker(&scorer, picker, &input, workers, request, eligibility)
-                .map(|(worker, cost)| (worker, cost, None))
+                .map(|(worker, cost)| (worker, cost, None, HintPlans::default()))
         }
         WorkerSelectionPolicyStateRef::Composed(state) => {
             let mut state = state.borrow_mut();
@@ -582,6 +597,7 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                 candidates,
                 cache_inputs,
                 load_inputs,
+                hints,
                 ..
             } = &mut *state;
             if candidates.is_empty() {
@@ -627,11 +643,16 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                         spec,
                     )
                 });
-                Some((candidate.worker, candidate.cost, trace))
+                // Only the winner's plans leave the actor; the rest are dropped here.
+                let hint_plans = hints
+                    .as_mut()
+                    .map(|hints| hints.take_winner(row))
+                    .unwrap_or_default();
+                Some((candidate.worker, candidate.cost, trace, hint_plans))
             }
         }
     };
-    let Some((worker, cost, selection_trace)) = selected else {
+    let Some((worker, cost, selection_trace, hint_plans)) = selected else {
         if eligibility.has_eligible_worker_ignoring_overload(
             workers
                 .iter()
@@ -648,6 +669,7 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
         block_size,
         input.max_raw_cached_tokens(),
         kv_transfer_source,
+        hint_plans,
     );
     log_selection(
         workers,
@@ -837,7 +859,14 @@ mod cache_reuse_tests {
         input.track_kept_candidate(second);
 
         assert_eq!(input.max_raw_cached_tokens(), Some(96));
-        let result = selection_result(&request, first, 16, input.max_raw_cached_tokens(), None);
+        let result = selection_result(
+            &request,
+            first,
+            16,
+            input.max_raw_cached_tokens(),
+            None,
+            HintPlans::default(),
+        );
         assert_eq!(result.max_raw_cached_tokens, Some(96));
         assert_eq!(result.selected_raw_cached_tokens, Some(48));
         assert_eq!(result.cached_tokens, 120);
@@ -854,7 +883,14 @@ mod cache_reuse_tests {
         input.track_kept_candidate(worker);
 
         assert_eq!(input.max_raw_cached_tokens(), None);
-        let result = selection_result(&request, worker, 16, input.max_raw_cached_tokens(), None);
+        let result = selection_result(
+            &request,
+            worker,
+            16,
+            input.max_raw_cached_tokens(),
+            None,
+            HintPlans::default(),
+        );
         assert_eq!(result.max_raw_cached_tokens, None);
         assert_eq!(result.selected_raw_cached_tokens, None);
     }
@@ -883,7 +919,14 @@ mod cache_reuse_tests {
         request.overlap.effective_cached_tokens.insert(selected, 3);
         assert_eq!(request.raw_cached_tokens_for(selected, 16), 64);
         assert_eq!(request.raw_cached_tokens_for(other_rank, 16), 112);
-        let result = selection_result(&request, selected, 16, Some(112), None);
+        let result = selection_result(
+            &request,
+            selected,
+            16,
+            Some(112),
+            None,
+            HintPlans::default(),
+        );
         assert_eq!(result.selected_raw_cached_tokens, Some(64));
     }
 

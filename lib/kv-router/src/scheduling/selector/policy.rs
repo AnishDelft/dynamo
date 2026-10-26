@@ -19,6 +19,7 @@ use crate::scheduling::config::KvRouterConfig;
 use crate::scheduling::filter::RoutingEligibility;
 use crate::scheduling::types::{KvSchedulerError, SchedulingRequest, WorkerSelectionPolicyError};
 
+use crate::plugins::hint_policy::runtime::HintSelection;
 use crate::plugins::worker_selection::{
     CacheSnapshot, CandidateData, ScoredWorkerCandidate, WorkerCacheData, WorkerCandidate,
     WorkerCandidates, WorkerFilter, WorkerInputs, WorkerLoadInput, WorkerPicker, WorkerScorer,
@@ -57,6 +58,9 @@ pub(super) struct ComposedPolicyState {
     pub(super) load_inputs: Vec<WorkerLoadInput>,
     /// Each unscored row's fetch target and local prefix while its source waits for every row.
     transfer_targets: Vec<Option<(KvTransferTarget, usize)>>,
+    /// Hint-policy selection stages, run after filters and before scorers. Boxed: most
+    /// partitions run none.
+    pub(super) hints: Option<Box<HintSelection>>,
 }
 
 /// Native scorer/picker composition for [`WorkerSelector`].
@@ -142,7 +146,39 @@ impl WorkerSelectionPolicy {
                 cache_inputs: Vec::new(),
                 load_inputs: Vec::new(),
                 transfer_targets: Vec::new(),
+                hints: None,
             })),
+        }
+    }
+
+    /// Run hint-policy selection stages in this policy's pipeline: after its filters, before its
+    /// scorers and picker. Their worker inputs are materialized alongside the scorers'.
+    pub(crate) fn with_hint_selection(mut self, hints: HintSelection) -> Self {
+        self.install_hint_selection(hints);
+        self
+    }
+
+    fn install_hint_selection(&mut self, hints: HintSelection) {
+        match &self.state {
+            #[cfg(any(test, feature = "bench"))]
+            WorkerSelectionPolicyState::Reference(..) => {
+                debug_assert!(false, "the reference selector does not run hint policies");
+            }
+            WorkerSelectionPolicyState::Composed(state) => {
+                let mut state = state.borrow_mut();
+                state.scorer_picker_inputs = state.scorer_picker_inputs | hints.inputs();
+                state.hints = Some(Box::new(hints));
+            }
+        }
+    }
+
+    fn take_hint_selection(&mut self) -> Option<HintSelection> {
+        match &self.state {
+            #[cfg(any(test, feature = "bench"))]
+            WorkerSelectionPolicyState::Reference(..) => None,
+            WorkerSelectionPolicyState::Composed(state) => {
+                state.borrow_mut().hints.take().map(|hints| *hints)
+            }
         }
     }
 
@@ -200,6 +236,10 @@ impl WorkerSelectionPolicy {
         }
         let response = state.config();
         replacement.runtime = Some(Box::new(state));
+        // Hint stages belong to the host's pipeline, not the replaced policy parameters.
+        if let Some(hints) = self.take_hint_selection() {
+            replacement.install_hint_selection(hints);
+        }
         *self = replacement;
         Ok(response)
     }
@@ -271,8 +311,8 @@ impl ComposedPolicyState {
             &mut self.cache_inputs,
             &mut self.load_inputs,
         );
-        if !self.scorers.is_empty() {
-            // Picker-only policies do not need a second copy of the worker inputs.
+        if !self.scorers.is_empty() || self.hints.is_some() {
+            // Picker-only policies without hint stages do not need a second copy of the inputs.
             self.unscored_candidates.push(candidate);
         }
     }
@@ -317,6 +357,59 @@ impl ComposedPolicyState {
         }
         Ok(())
     }
+
+    /// Apply hint-policy advice to the collected rows, then score them. Rows a hint policy
+    /// excludes are dropped before scoring, as a filter would drop them; hint costs are added
+    /// after the configured scorers, before the picker.
+    fn advise_and_score(
+        &mut self,
+        input: &MaterializedSelectionInput<'_>,
+    ) -> Result<(), KvSchedulerError> {
+        if let Some(hints) = self.hints.as_mut()
+            && !self.unscored_candidates.is_empty()
+        {
+            hints.advise(
+                &input.context,
+                &self.unscored_candidates,
+                &input.cache_snapshot,
+            )?;
+            if let Some(keep) = hints.kept_rows() {
+                retain_rows(&mut self.unscored_candidates, keep);
+                retain_rows(&mut self.candidates, keep);
+                if self.cache_inputs.len() == keep.len() {
+                    retain_rows(&mut self.cache_inputs, keep);
+                }
+                if self.load_inputs.len() == keep.len() {
+                    retain_rows(&mut self.load_inputs, keep);
+                }
+                input.retrack_kept_candidates(
+                    self.unscored_candidates
+                        .iter()
+                        .map(|candidate| candidate.worker),
+                );
+                hints.retain_kept();
+            }
+        }
+        self.score_candidates(&input.context, &input.cache_snapshot)?;
+        if let Some(hints) = &self.hints {
+            for (row, (scored, cost)) in self.candidates.iter_mut().zip(hints.costs()).enumerate() {
+                let total = scored.cost + cost;
+                if !total.is_finite() {
+                    return Err(WorkerSelectionPolicyError::failed(format!(
+                        "hint-policy costs made candidate row {row}'s total cost non-finite"
+                    ))
+                    .into());
+                }
+                scored.cost = total;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn retain_rows<T>(rows: &mut Vec<T>, keep: &[bool]) {
+    let mut keep = keep.iter().copied();
+    rows.retain(|_| keep.next().unwrap_or(false));
 }
 
 // Out of line so rows that need no fetch input keep the loop body small.
@@ -343,7 +436,8 @@ pub(super) fn collect_policy_candidates<C: WorkerConfigLike>(
     state.cache_inputs.clear();
     state.load_inputs.clear();
     state.transfer_targets.clear();
-    // Only scorers declare KV_TRANSFER; their inputs are filled once every row is built.
+    // Only scorers and hint selection stages read KV_TRANSFER; their inputs are filled once every
+    // row is built, before hint advice and scoring.
     let defer_transfer = request.kv_transfer_candidates.is_some()
         && state
             .scorer_picker_inputs
@@ -380,8 +474,9 @@ pub(super) fn collect_policy_candidates<C: WorkerConfigLike>(
                 &state.transfer_targets,
             );
         }
-        state.score_candidates(&input.context, &input.cache_snapshot)?;
-        return Ok(!state.candidates.is_empty());
+        let has_eligible_worker = !state.candidates.is_empty();
+        state.advise_and_score(input)?;
+        return Ok(has_eligible_worker);
     }
 
     let additional_inputs = state.scorer_picker_inputs.without(state.filter_inputs);
@@ -449,7 +544,7 @@ pub(super) fn collect_policy_candidates<C: WorkerConfigLike>(
             &state.transfer_targets,
         );
     }
-    state.score_candidates(&input.context, &input.cache_snapshot)?;
+    state.advise_and_score(input)?;
     Ok(has_eligible_worker)
 }
 

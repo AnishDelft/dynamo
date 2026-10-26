@@ -1118,6 +1118,9 @@ pub struct WorkerSelectionResult {
     /// The source the selected worker fetches its KV prefix from, chosen with
     /// the same rule that credited the fetch during selection.
     pub kv_transfer_source: Option<KvTransferSourceChoice>,
+    /// Hint-policy plans attached to the selected worker during this evaluation. Empty when no
+    /// hint policy ran or planned for it.
+    pub hint_plans: crate::plugins::hint_policy::HintPlans,
 }
 
 /// How many candidates a selection trace retains: the `top_k` lowest-cost rows

@@ -1786,6 +1786,7 @@ impl<
                     selected_worker_tiers: selected.selected_worker_tiers,
                     kv_transfer_source: selected.selection.kv_transfer_source,
                     kv_transfer_candidates: request.kv_transfer_candidates.take(),
+                    hint_plans: selected.selection.hint_plans,
                     potential_decode_blocks: selected.selection.potential_decode_blocks,
                     selection_trace: selected.selection_trace,
                 },
@@ -1831,6 +1832,7 @@ impl<
             selected_worker_tiers: selected.selected_worker_tiers,
             kv_transfer_source: selected.selection.kv_transfer_source,
             kv_transfer_candidates: request.kv_transfer_candidates.take(),
+            hint_plans: selected.selection.hint_plans,
             potential_decode_blocks: selected.selection.potential_decode_blocks,
             selection_trace: selected.selection_trace,
         };
@@ -2281,6 +2283,7 @@ mod tests {
                 potential_decode_blocks: request
                     .potential_decode_blocks_after_admission(worker, block_size),
                 kv_transfer_source: None,
+                hint_plans: Default::default(),
             })
         }
     }
