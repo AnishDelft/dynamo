@@ -153,8 +153,7 @@ func (o DGDRV1beta2Options) resolveHardware(
 	if !hasBudget {
 		var gpus int
 		if found != nil {
-			// TODO(#17192): Use the discovered aggregate GPU count so mixed node sizes of one SKU are counted correctly.
-			gpus = found.GPUsPerNode * found.NodesWithGPUs
+			gpus = found.TotalGPUs
 		}
 		if gpus <= 0 {
 			return hardwareDefaultsV1beta2{}, rejectHardwareV1beta2(field.Required(gpuPath.Child("budget"), fmt.Sprintf(
