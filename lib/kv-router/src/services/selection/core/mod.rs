@@ -25,6 +25,7 @@ use crate::indexer::{
 use crate::kv_hints::{
     KvHint, KvHintAction, KvSourceLocationsPayload, KvTransferCandidateSource, KvTransferCandidates,
 };
+use crate::plugins::hint_policy::HintPolicyFactory;
 use crate::protocols::{
     LocalBlockHash, PrefillLoadHint, SharedCacheHits, WorkerAffinityTarget, WorkerConfigLike,
     WorkerId, WorkerWithDpRank,
@@ -60,6 +61,7 @@ mod run;
 mod tests;
 mod workers;
 
+use hint::HintPolicySlot;
 use reservations::ReservationIndex;
 
 pub use operation::{
@@ -129,6 +131,9 @@ struct SelectionEntry {
     replica_inbox: Option<ReplicaInbox>,
     affinity: OnceCell<SessionAffinity>,
     replica_config: Option<ReplicaSyncConfig>,
+    /// This partition's hint policies in configured order; their selection stages run inside
+    /// `scheduler`'s worker-selection policy.
+    hint_policies: Vec<HintPolicySlot>,
 }
 
 impl SelectionEntry {
@@ -171,6 +176,14 @@ pub struct SelectionHost {
     pub eligibility: HostEligibility,
     pub telemetry: HostTelemetry,
     pub replication: HostReplication,
+    pub hints: HostHints,
+}
+
+/// Hint policies the core instantiates for every partition.
+#[derive(Clone, Default)]
+pub struct HostHints {
+    /// The resolved hint policies; `None` runs no hint policies.
+    pub policies: Option<HintPolicyFactory>,
 }
 
 /// Load signals the host knows and the partition scheduler does not.

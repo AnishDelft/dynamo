@@ -1103,6 +1103,10 @@ pub struct WorkerSelectionResult {
     /// Selected worker's projected decode load after adding this request's
     /// prompt blocks, in scheduler-tracked block units.
     pub potential_decode_blocks: usize,
+
+    /// Hint-policy plans attached to the selected worker during this evaluation. Empty when no
+    /// hint policy ran or planned for it.
+    pub hint_plans: crate::plugins::hint_policy::HintPlans,
 }
 
 /// How many candidates a selection trace retains: the `top_k` lowest-cost rows

@@ -13,6 +13,7 @@ use dynamo_tokens::SequenceHash;
 use parking_lot::Mutex;
 
 use crate::identity::RoutingPartitionId;
+use crate::plugins::hint_policy::HintPlans;
 use crate::protocols::{LocalBlockHash, WorkerWithDpRank};
 
 /// How long a pending selection lives before it is evicted.
@@ -61,6 +62,15 @@ pub(super) struct PendingSelection {
     pub routing_hashes: Option<Vec<LocalBlockHash>>,
     /// The session the selection steered by, bound when the booking replays.
     pub session_id: Option<String>,
+    /// What the replayed booking needs to formulate the KV hint this selection planned;
+    /// `None` when the partition runs no hint policies.
+    pub hint: Option<PendingHint>,
+}
+
+/// The selected worker's hint plans, for the booking that replays the selection.
+pub(super) struct PendingHint {
+    /// Taken by the booking that formulates the hint, so a selection's plans are used once.
+    pub plans: Mutex<Option<HintPlans>>,
 }
 
 struct Entry {
@@ -278,6 +288,7 @@ mod tests {
             lora_name: None,
             routing_hashes: None,
             session_id: None,
+            hint: None,
         }
     }
 

@@ -8,6 +8,7 @@ use std::collections::HashSet;
 
 use super::reservations::{ReservationIndexObserver, spawn_reservation_index_sweep};
 use super::*;
+use crate::plugins::hint_policy::runtime::HintSelection;
 use crate::sequences::topology::MAX_DATA_PARALLEL_RANKS_PER_WORKER;
 
 impl SelectionCore {
@@ -293,6 +294,8 @@ impl SelectionCore {
                     block_size,
                     host_replica,
                 );
+                // Instantiate before any partition task starts, so a rejected policy leaves nothing.
+                let hints = self.partition_hint_policies(&key)?;
                 let worker_label = self.worker_type.as_str();
                 let slots = Arc::new(ActiveSequencesMultiWorker::new_with_options(
                     scoped_replica_sync
@@ -342,6 +345,14 @@ impl SelectionCore {
                     self.worker_type,
                     key.as_ref(),
                 );
+                let PartitionHints {
+                    policies: hint_policies,
+                    selection: hint_selection,
+                } = hints;
+                let selector = match hint_selection {
+                    Some(hint_selection) => selector.with_hint_selection(hint_selection),
+                    None => selector,
+                };
                 let profile = self
                     .kv_router_config
                     .policy_profile(Some(&key.model_name))
@@ -374,6 +385,7 @@ impl SelectionCore {
                     replica_inbox,
                     affinity: OnceCell::new(),
                     replica_config: self.replica_config.clone(),
+                    hint_policies,
                 }))
             })?
             .clone();
@@ -406,6 +418,39 @@ impl SelectionCore {
         ingress.detach(&self.indexer_registry, record).await;
     }
 
+    /// Construct this partition's hint policies and split them into the selection stages the
+    /// scheduler runs and the KV-action stages bookings run.
+    fn partition_hint_policies(
+        &self,
+        key: &RoutingPartitionId,
+    ) -> Result<PartitionHints, SelectionError> {
+        let factory = self
+            .host
+            .hints
+            .policies
+            .clone()
+            .unwrap_or_else(HintPolicyFactory::none);
+        let instances = factory
+            .instances(&self.kv_router_config, self.worker_type, key.as_ref())
+            .map_err(|error| SelectionError::Internal(error.to_string()))?;
+        let mut policies = Vec::with_capacity(instances.len());
+        let mut stages = Vec::new();
+        for (index, instance) in instances.into_iter().enumerate() {
+            let stages_of = instance.into_stages();
+            if let Some(stage) = stages_of.selection {
+                stages.push((index, stage));
+            }
+            policies.push(HintPolicySlot {
+                name: stages_of.name,
+                actions: stages_of.actions,
+            });
+        }
+        Ok(PartitionHints {
+            policies,
+            selection: (!stages.is_empty()).then(|| HintSelection::new(stages)),
+        })
+    }
+
     pub(super) fn publish_scheduler_config(&self, key: &RoutingPartitionId) {
         let Some(entry) = self.entry(key) else {
             return;
@@ -427,4 +472,10 @@ impl SelectionCore {
             self.publish_count.fetch_add(1, Ordering::SeqCst);
         }
     }
+}
+
+/// A partition's constructed hint policies.
+struct PartitionHints {
+    policies: Vec<HintPolicySlot>,
+    selection: Option<HintSelection>,
 }

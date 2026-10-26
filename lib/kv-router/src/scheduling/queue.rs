@@ -1806,6 +1806,7 @@ impl<
                     selected_worker_tiers: selected.selected_worker_tiers,
                     target_cached_prefix_blocks,
                     kv_transfer_candidates: request.kv_transfer_candidates.take(),
+                    hint_plans: selected.selection.hint_plans,
                     potential_decode_blocks: selected.selection.potential_decode_blocks,
                     selection_trace: selected.selection_trace,
                 },
@@ -1853,6 +1854,7 @@ impl<
             selected_worker_tiers: selected.selected_worker_tiers,
             target_cached_prefix_blocks,
             kv_transfer_candidates: request.kv_transfer_candidates.take(),
+            hint_plans: selected.selection.hint_plans,
             potential_decode_blocks: selected.selection.potential_decode_blocks,
             selection_trace: selected.selection_trace,
         };
@@ -2302,6 +2304,7 @@ mod tests {
                 selected_raw_cached_tokens: None,
                 potential_decode_blocks: request
                     .potential_decode_blocks_after_admission(worker, block_size),
+                hint_plans: Default::default(),
             })
         }
     }
