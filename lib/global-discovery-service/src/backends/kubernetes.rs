@@ -11,9 +11,13 @@
 //!
 //! Each pool's PoolRelay Service, named `<DGD name>-pool-relay` by default,
 //! needs a `ServiceExport`, and so does the router's Service in the hub, so
-//! its replicas appear in every importing cluster. A pool is live while its
-//! PoolRelay endpoint is Ready, and its `relay_identity` is that endpoint's
-//! address, for routers on a trusted network to admit the PoolRelay.
+//! its replicas appear in every importing cluster. Read alone, a pool is live
+//! while its PoolRelay endpoint is Ready, and its `relay_identity` is that
+//! endpoint's address, for routers on a trusted network to admit the
+//! PoolRelay. The service also needs a live registration, which says what the
+//! pool serves ([`crate::backends::registered`]), and reads the pool's
+//! frontend addresses from its exported frontend Service, named
+//! `<DGD name>-frontend` by default.
 //!
 //! Create the PoolRelay Service and its `ServiceExport` in the workload
 //! cluster, not through Karmada propagation. Kubernetes copies a Service's
@@ -24,10 +28,14 @@
 //! changed.
 //!
 //! ```ignore
+//! let registrations = Arc::new(MemoryPoolStore::new(lease));
+//! let imported = McsPoolDirectory::new(client.clone(), mcs, suffix, frontends)?;
 //! let store = DiscoveryStore {
-//!     pools: Arc::new(McsPoolDirectory::new(client.clone(), mcs, suffix)),
+//!     pools: Arc::new(RegisteredPoolDirectory::new(Arc::new(imported), registrations.clone(), lease)),
 //!     routers: Arc::new(EndpointSliceReplicaDirectory::imported(client, &router, mcs)),
-//!     registrar: None,
+//!     registrar: Some(registrations),
+//!     // Or the `Sharing` from `crate::peers::PeerSync::new`.
+//!     sharing: None,
 //! };
 //! service::serve(listener, store, None, shutdown).await?;
 //! ```
@@ -38,5 +46,5 @@ pub mod hub;
 pub mod mcs;
 
 pub use endpoints::{EndpointSliceReplicaDirectory, ExportedService};
-pub use hub::McsPoolDirectory;
+pub use hub::{FrontendService, McsPoolDirectory};
 pub use mcs::McsImplementation;

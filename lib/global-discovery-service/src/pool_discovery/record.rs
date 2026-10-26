@@ -18,8 +18,8 @@ pub struct Revision(pub u64);
 pub struct PoolRecord {
     pub key: PoolKey,
     pub location: PoolLocation,
-    // The fields below are empty until the pool registers them. The MCS store
-    // knows only the pool's name and its PoolRelay.
+    // The fields below are empty until the pool registers them. MCS alone
+    // gives only the pool's name, its PoolRelay and its frontends.
     pub model: Option<String>,
     pub capabilities: Vec<String>,
     /// URLs of the pool's local frontends, which a Global Router sends
