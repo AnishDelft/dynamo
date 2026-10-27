@@ -156,7 +156,9 @@ func (a *MembershipAdapter) adoptInitial(ctx context.Context, snapshot kubejourn
 		if err != nil {
 			return membershipBinding{}, snapshot, err
 		}
-		topology.Replicas = appendMemberSubset(topology.Replicas, process.Membership)
+		if process.Rank == rank {
+			topology.Replicas = appendMemberSubset(topology.Replicas, process.Membership)
+		}
 	}
 	for _, allocation := range topology.Replicas {
 		if len(allocation.Members) != int(a.Layout.NativeMembersPerReplica) {
@@ -198,37 +200,51 @@ func (a *MembershipAdapter) readTopology(ctx context.Context, topology enginegro
 	if err != nil {
 		return nil, err
 	}
-	processes := make([]Process, len(byRank))
+	processes := make([]Process, 0, len(a.Processes))
 	for rank, membership := range byRank {
 		process, err := a.process(int32(rank))
-		if err != nil || !reflect.DeepEqual(process.Membership, membership) {
+		if err != nil || !containsMemberSubset([]enginegroup.ReplicaMembership{process.Membership}, membership) {
 			return nil, fmt.Errorf("vLLM DP rank %d no longer matches its frozen process incarnation", rank)
 		}
-		processes[rank] = process
+		if process.Rank == int32(rank) {
+			if len(process.Membership.Members) > len(byRank)-rank {
+				return nil, fmt.Errorf("vLLM topology cuts an owning client's local range")
+			}
+			processes = append(processes, process)
+		}
 	}
 
 	// Bound the complete observation by one native read budget, rather than serializing a timeout per rank.
-	statuses := make([]Status, len(processes))
+	statuses := make([]Status, len(byRank))
 	failures := make([]error, len(processes))
 	var pending sync.WaitGroup
-	for rank, process := range processes {
+	for index, process := range processes {
 		pending.Go(func() {
-			statuses[rank], failures[rank] = process.Client.Observe(ctx)
+			status, err := process.Client.Observe(ctx)
+			failures[index] = err
+			for offset := range process.Membership.Members {
+				statuses[int(process.Rank)+offset] = status
+			}
 		})
 	}
 	pending.Wait()
 	if err := errors.Join(failures...); err != nil {
 		return nil, err
 	}
-	seen := make(map[string]bool, len(statuses))
+	seen := make(map[string]int32, len(processes))
 	for rank, status := range statuses {
-		if seen[status.InstanceID] || (instances != nil && status.InstanceID != instances[rank]) {
+		process, err := a.process(int32(rank))
+		if err != nil {
+			return nil, err
+		}
+		owner, exists := seen[status.InstanceID]
+		if (exists && owner != process.Rank) || (instances != nil && status.InstanceID != instances[rank]) {
 			return nil, fmt.Errorf("vLLM DP rank %d changed or duplicated a pinned API process", rank)
 		}
 		if !sameNativeStatus(statuses[0], status) {
 			return nil, fmt.Errorf("vLLM rank observations do not yet agree on the same native operation and topology")
 		}
-		seen[status.InstanceID] = true
+		seen[status.InstanceID] = process.Rank
 	}
 	return statuses, nil
 }

@@ -82,12 +82,15 @@ class EngineGroupServing:
         can_serve: Callable[[], bool],
         verify: Callable[[], Awaitable[bool]],
         drain_requests: bool = False,
+        rank_count: int = 1,
     ) -> None:
+        if rank < 0 or rank_count < 1:
+            raise ValueError("a worker must own a nonempty native DP range")
         self.engine = engine
         self.endpoint = endpoint
         self.pod_uid = pod_uid
-        self.member_id = f"dp-{rank}"
         self.rank = rank
+        self.rank_count = rank_count
         self.discovery = discovery
         self.can_serve = can_serve
         self.verify = verify
@@ -136,7 +139,10 @@ class EngineGroupServing:
             self.native_instance_id = None
             self.is_retired = False
             raise NativeObservationError("native serving state is unknown") from error
-        if binding is not None and self.rank >= binding.data_parallel_size:
+        if (
+            binding is not None
+            and self.rank + self.rank_count > binding.data_parallel_size
+        ):
             binding = None
         if binding != self.binding:
             self.verified = None
@@ -190,7 +196,9 @@ class EngineGroupServing:
     def status(self) -> dict:
         return {
             "pod_uid": self.pod_uid,
-            "member_id": self.member_id,
+            "member_ids": [
+                f"dp-{rank}" for rank in range(self.rank, self.rank + self.rank_count)
+            ],
             "binding": asdict(self.binding) if self.binding else None,
             "verified": self.binding is not None
             and self.verified == self.binding

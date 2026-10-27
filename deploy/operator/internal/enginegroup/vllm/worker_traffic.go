@@ -125,7 +125,7 @@ func (a *WorkerTraffic) Observe(ctx context.Context, groupID enginegroup.GroupID
 				worker.Binding.DataParallelSize != membership.CommittedTopology.NativeMemberCount() {
 				return enginegroup.TrafficObservation{}, fmt.Errorf("registered worker lacks current native serving evidence")
 			}
-			observed.Admitted = appendMemberSubset(observed.Admitted, process.Membership)
+			observed.Admitted = appendMemberSubset(observed.Admitted, member)
 		}
 	}
 
@@ -139,7 +139,9 @@ func (a *WorkerTraffic) Observe(ctx context.Context, groupID enginegroup.GroupID
 		member := drain.Membership
 		id := member.Members[0].ID
 		proven := containsMemberSubset(state.Drained, member)
-		index := slices.IndexFunc(a.Membership.Processes, func(process Process) bool { return process.Membership.Members[0].ID == id })
+		index := slices.IndexFunc(a.Membership.Processes, func(process Process) bool {
+			return slices.ContainsFunc(process.Membership.Members, func(candidate enginegroup.NativeMemberIncarnation) bool { return candidate.ID == id })
+		})
 		if index < 0 {
 			if !proven {
 				return enginegroup.TrafficObservation{}, fmt.Errorf("withdrawn process disappeared without terminal drain evidence")
@@ -148,7 +150,7 @@ func (a *WorkerTraffic) Observe(ctx context.Context, groupID enginegroup.GroupID
 			continue
 		}
 		process := a.Membership.Processes[index]
-		if !reflect.DeepEqual(process.Membership, member) {
+		if !containsMemberSubset([]enginegroup.ReplicaMembership{process.Membership}, member) {
 			return enginegroup.TrafficObservation{}, fmt.Errorf("withdrawn member changed its process incarnation")
 		}
 		worker, err := observeWorker(ctx, process)
@@ -205,7 +207,7 @@ func (a *WorkerTraffic) retirementComplete(ctx context.Context, state workerTraf
 	if err != nil {
 		return false, err
 	}
-	return native.InstanceID == state.Instances[process.Membership.Members[0].ID] &&
+	return native.InstanceID == worker.InstanceID &&
 		native.Phase == PhaseCompleted && native.TopologyKnown &&
 		ptr.Deref(native.OperationID, "") == binding.NativeOperationID &&
 		ptr.Deref(native.Epoch, "") == binding.NativeEpoch &&

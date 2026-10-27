@@ -52,7 +52,7 @@ func TestResizeFansOutConcurrentlyToEveryOldRank(t *testing.T) {
 				t.Cleanup(server.Close)
 				control, err := NewClient(server.URL, server.Client())
 				require.NoError(t, err)
-				participants = append(participants, Participant{Rank: rank, ExpectedInstanceID: instance, Client: control})
+				participants = append(participants, Participant{Rank: rank, LocalSize: 1, ExpectedInstanceID: instance, Client: control})
 			}
 			resize := Resize{
 				OperationID: "resize-1", BaseDataParallelSize: 2, NewDataParallelSize: target,
@@ -119,8 +119,8 @@ func TestResizePreservesMixedFanoutEvidence(t *testing.T) {
 	resize := Resize{
 		OperationID: "grow-1", BaseDataParallelSize: 2, NewDataParallelSize: 3, DrainTimeout: 120,
 		Participants: []Participant{
-			{Rank: 0, ExpectedInstanceID: "api-0", Client: control0},
-			{Rank: 1, ExpectedInstanceID: "api-1", Client: control1},
+			{Rank: 0, LocalSize: 1, ExpectedInstanceID: "api-0", Client: control0},
+			{Rank: 1, LocalSize: 1, ExpectedInstanceID: "api-1", Client: control1},
 		},
 	}
 
@@ -142,6 +142,7 @@ func TestResizeValidatesCompleteParticipantsBeforeEffects(t *testing.T) {
 		base      int32
 		target    int32
 		ranks     []int32
+		widths    []int32
 		instances []string
 	}{
 		{name: "missing old rank", base: 2, target: 3, ranks: []int32{0}, instances: []string{"api-0"}},
@@ -153,6 +154,9 @@ func TestResizeValidatesCompleteParticipantsBeforeEffects(t *testing.T) {
 		{name: "zero target", base: 2, target: 0, ranks: []int32{0, 1}, instances: []string{"api-0", "api-1"}},
 		{name: "no-op is not correlated commit", base: 2, target: 2, ranks: []int32{0, 1}, instances: []string{"api-0", "api-1"}},
 		{name: "empty base", target: 3},
+		{name: "target bisects an owner", base: 4, target: 3, ranks: []int32{0, 2}, widths: []int32{2, 2}, instances: []string{"api-0", "api-2"}},
+		{name: "overlapping owner ranges", base: 4, target: 6, ranks: []int32{0, 2}, widths: []int32{3, 2}, instances: []string{"api-0", "api-2"}},
+		{name: "owner extends beyond base", base: 4, target: 6, ranks: []int32{0, 2}, widths: []int32{2, 3}, instances: []string{"api-0", "api-2"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -165,7 +169,10 @@ func TestResizeValidatesCompleteParticipantsBeforeEffects(t *testing.T) {
 			require.NoError(t, err)
 			participants := make([]Participant, len(test.ranks))
 			for i, rank := range test.ranks {
-				participants[i] = Participant{Rank: rank, ExpectedInstanceID: test.instances[i], Client: control}
+				participants[i] = Participant{Rank: rank, LocalSize: 1, ExpectedInstanceID: test.instances[i], Client: control}
+				if test.widths != nil {
+					participants[i].LocalSize = test.widths[i]
+				}
 			}
 			resize := Resize{
 				OperationID: "resize-1", BaseDataParallelSize: test.base, NewDataParallelSize: test.target,

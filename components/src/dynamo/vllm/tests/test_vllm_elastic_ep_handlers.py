@@ -23,11 +23,12 @@ import pytest
 pytest.importorskip("torch")
 pytest.importorskip("vllm.config")
 
-from vllm.entrypoints.serve.elastic_ep import middleware  # noqa: E402
-from vllm.v1.engine.exceptions import EngineDeadError  # noqa: E402
-
+from dynamo.vllm.dp_topology import get_dp_range_for_worker  # noqa: E402
 from dynamo.vllm.engine_group import EngineGroupServing  # noqa: E402
 from dynamo.vllm.handlers import BaseWorkerHandler  # noqa: E402
+from vllm.config import ParallelConfig, VllmConfig  # noqa: E402
+from vllm.entrypoints.serve.elastic_ep import middleware  # noqa: E402
+from vllm.v1.engine.exceptions import EngineDeadError  # noqa: E402
 
 pytestmark = [
     pytest.mark.unit,
@@ -59,6 +60,7 @@ def _make_handler(
                 enable_elastic_ep=True,
                 data_parallel_backend="ray",
                 data_parallel_external_lb=False,
+                elastic_ep_auto_bootstrap=False,
             ),
         ),
         scale_elastic_ep=AsyncMock(),
@@ -91,10 +93,11 @@ def test_managed_worker_honors_native_admission(
 
 
 @pytest.mark.asyncio
-async def test_managed_probe_uses_the_real_local_engine_without_controller_action():
+@pytest.mark.parametrize("width", [1, 2, 4])
+async def test_managed_probe_covers_every_local_engine_without_controller_action(width):
     handler = _make_handler(tensor_parallel_size=1)
     handler._pause_lock = asyncio.Lock()
-    handler.dp_range = (2, 1)
+    handler.dp_range = (2, width)
     engine = handler.engine_client
     engine.get_external_elastic_ep_status = AsyncMock(
         return_value={
@@ -108,7 +111,9 @@ async def test_managed_probe_uses_the_real_local_engine_without_controller_actio
             "error": None,
         }
     )
-    engine.generate = Mock(return_value=_successful_serving_probe())
+    engine.generate = Mock(
+        side_effect=lambda *args, **kwargs: _successful_serving_probe()
+    )
     engine.check_health = AsyncMock()
     handler.can_serve_engine_group = Mock(return_value=True)
     admission = EngineGroupServing(
@@ -123,6 +128,7 @@ async def test_managed_probe_uses_the_real_local_engine_without_controller_actio
         Mock(instance_ids=Mock(return_value=[])),
         handler.can_serve_engine_group,
         handler.probe_engine_group,
+        rank_count=width,
     )
     admission.is_ready = True
     handler.engine_group_serving = admission
@@ -130,9 +136,27 @@ async def test_managed_probe_uses_the_real_local_engine_without_controller_actio
     result = await handler.probe_engine_group()
 
     assert result
-    assert engine.generate.call_args.kwargs["data_parallel_rank"] == 0
+    assert [
+        call.kwargs["data_parallel_rank"] for call in engine.generate.call_args_list
+    ] == list(range(width))
     assert not admission.is_admitted
     admission.endpoint.register_endpoint_instance.assert_not_awaited()
+
+
+def test_packed_worker_advertises_only_its_local_range_after_growth():
+    parallel = ParallelConfig(
+        data_parallel_size=2,
+        data_parallel_size_local=2,
+        data_parallel_rank=0,
+        distributed_executor_backend="mp",
+    )
+    config = VllmConfig(parallel_config=parallel)
+    # Exercise the runtime projection without initializing a GPU-only EPLB configuration.
+    parallel.enable_elastic_ep = True
+    parallel.elastic_ep_auto_bootstrap = True
+    assert get_dp_range_for_worker(config) == (0, 2)
+    parallel.data_parallel_size = 4
+    assert get_dp_range_for_worker(config) == (0, 2)
 
 
 @pytest.mark.asyncio
@@ -313,6 +337,7 @@ class _FakeVllmEngine:
                 enable_elastic_ep=enable_elastic_ep,
                 data_parallel_backend=data_parallel_backend,
                 data_parallel_external_lb=False,
+                elastic_ep_auto_bootstrap=False,
             )
         )
         self._fail_sizes = list(fail_sizes)

@@ -579,7 +579,9 @@ func (f *membershipFixture) target(t *testing.T, base enginegroup.MembershipTopo
 		}
 	} else {
 		for rank := base.NativeMemberCount(); rank < size; rank++ {
-			membership := f.adapter.Processes[rank].Membership
+			process, err := f.adapter.process(rank)
+			require.NoError(t, err)
+			membership := process.Membership
 			membership.Members = append([]enginegroup.NativeMemberIncarnation(nil), membership.Members...)
 			joining = appendMemberSubset(joining, membership)
 		}

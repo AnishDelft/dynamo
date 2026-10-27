@@ -46,6 +46,8 @@ def engine():
             parallel_config=SimpleNamespace(
                 enable_elastic_ep=True,
                 data_parallel_external_lb=True,
+                elastic_ep_auto_bootstrap=False,
+                data_parallel_backend="mp",
             )
         ),
         scale_elastic_ep=AsyncMock(return_value=status),
@@ -241,13 +243,15 @@ async def test_status_without_correlation_is_not_upgraded_to_evidence(
 
 @pytest.mark.parametrize("enabled", [True, False])
 @pytest.mark.parametrize("external", [True, False])
+@pytest.mark.parametrize("automatic", [True, False])
 def test_mode_selection_requires_both_external_ownership_and_elastic_ep(
-    engine, enabled, external
+    engine, enabled, external, automatic
 ):
     parallel = engine.vllm_config.parallel_config
     parallel.enable_elastic_ep = enabled
     parallel.data_parallel_external_lb = external
-    assert uses_external_elastic_ep(engine) is (enabled and external)
+    parallel.elastic_ep_auto_bootstrap = automatic
+    assert uses_external_elastic_ep(engine) is (enabled and (external or automatic))
 
 
 @pytest.mark.asyncio

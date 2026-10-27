@@ -8,6 +8,7 @@ package vllm
 import (
 	"context"
 	"fmt"
+	"math"
 	"reflect"
 
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/enginegroup"
@@ -16,10 +17,9 @@ import (
 
 const membershipBindingVersion = 1
 
-// Process binds a profile-proven DP rank and frozen workload-process lifetime to its native API endpoint.
-// Membership identifies this process's one-member subset, not the whole allocation.
-// Several processes may share a ReplicaID and PodUID. Client must address this exact process.
-// The runtime resolver owns the proof that this endpoint belongs to this physical process incarnation.
+// Process binds one API/client lifetime to the contiguous native range it owns.
+// Rank is the first global DP rank; Membership freezes every local engine incarnation.
+// Client must address this owner, not an individual child engine.
 type Process struct {
 	Rank       int32
 	PodUID     enginegroup.PodUID
@@ -60,7 +60,7 @@ type membershipBinding struct {
 	Result             *enginegroup.MembershipTransitionObservation `json:"result,omitempty"`
 }
 
-// Apply durably binds the complete target before dispatching to every old rank.
+// Apply durably binds the complete target before dispatching once to every old client.
 // Replays observe first and preserve the original target, API instance preconditions, and native epoch.
 func (a *MembershipAdapter) Apply(ctx context.Context, groupID enginegroup.GroupID, target enginegroup.MembershipTarget) error {
 	// Establish fresh native evidence before interpreting a transport error or replaying an accepted intent.
@@ -123,13 +123,11 @@ func (a *MembershipAdapter) Apply(ctx context.Context, groupID enginegroup.Group
 	if failure != nil {
 		return fmt.Errorf("validated vLLM plan became unsupported: %s", failure.Message)
 	}
-	participants := make([]Participant, len(state.Instances))
-	for rank, instance := range state.Instances {
-		process, err := a.process(int32(rank))
-		if err != nil {
-			return err
+	participants := make([]Participant, 0, len(a.Processes))
+	for _, process := range a.Processes {
+		if process.Rank < int32(len(state.Instances)) {
+			participants = append(participants, Participant{Rank: process.Rank, LocalSize: int32(len(process.Membership.Members)), ExpectedInstanceID: state.Instances[process.Rank], Client: process.Client})
 		}
-		participants[rank] = Participant{Rank: int32(rank), ExpectedInstanceID: instance, Client: process.Client}
 	}
 	results, applyErr := (Resize{
 		OperationID: target.TransitionID, BaseDataParallelSize: target.BaseTopology.NativeMemberCount(),
@@ -173,10 +171,16 @@ func (a *MembershipAdapter) validate(groupID enginegroup.GroupID) error {
 	runtimes := make(map[enginegroup.RuntimeIncarnationID]bool, len(a.Processes))
 	for _, process := range a.Processes {
 		membership := process.Membership
-		if process.Rank < 0 || ranks[process.Rank] || membership.ReplicaID == "" ||
-			len(membership.Members) != 1 || membership.Members[0].ID != enginegroup.NativeMemberID(fmt.Sprintf("dp-%d", process.Rank)) ||
-			membership.Members[0].RuntimeIncarnation == "" || runtimes[membership.Members[0].RuntimeIncarnation] {
-			return fmt.Errorf("vLLM runtime binding needs distinct DP ranks and independent frozen process identities")
+		if process.Rank < 0 || membership.ReplicaID == "" || len(membership.Members) == 0 || process.Client == nil {
+			return fmt.Errorf("vLLM runtime binding needs a client and a nonempty native range")
+		}
+		for offset, member := range membership.Members {
+			rank := int64(process.Rank) + int64(offset)
+			if rank > math.MaxInt32 || ranks[int32(rank)] || member.ID != enginegroup.NativeMemberID(fmt.Sprintf("dp-%d", rank)) ||
+				member.RuntimeIncarnation == "" || runtimes[member.RuntimeIncarnation] {
+				return fmt.Errorf("vLLM runtime binding needs disjoint contiguous DP ranges and frozen engine identities")
+			}
+			ranks[int32(rank)], runtimes[member.RuntimeIncarnation] = true, true
 		}
 		// Members may share an allocation, but a Pod cannot host unrelated allocations or change their binding.
 		if pod, exists := replicas[membership.ReplicaID]; exists && pod != process.PodUID {
@@ -188,8 +192,7 @@ func (a *MembershipAdapter) validate(groupID enginegroup.GroupID) error {
 			}
 			pods[process.PodUID] = membership.ReplicaID
 		}
-		ranks[process.Rank], replicas[membership.ReplicaID] = true, process.PodUID
-		runtimes[membership.Members[0].RuntimeIncarnation] = true
+		replicas[membership.ReplicaID] = process.PodUID
 	}
 	return nil
 }
@@ -207,12 +210,17 @@ func (a *MembershipAdapter) load(ctx context.Context) (membershipBinding, kubejo
 	if _, err := membersByRank(state.Topology); err != nil {
 		return membershipBinding{}, snapshot, err
 	}
-	instances := make(map[string]bool, len(state.Instances))
-	for _, instance := range state.Instances {
-		if !validIdentifier(instance) || instances[instance] {
+	instances := make(map[string]int32, len(state.Instances))
+	for rank, instance := range state.Instances {
+		process, err := a.process(int32(rank))
+		if err != nil {
+			return membershipBinding{}, snapshot, err
+		}
+		owner, exists := instances[instance]
+		if !validIdentifier(instance) || (exists && owner != process.Rank) {
 			return membershipBinding{}, snapshot, fmt.Errorf("vLLM membership binding lacks a native API process identity")
 		}
-		instances[instance] = true
+		instances[instance] = process.Rank
 	}
 	if err := a.validateBinding(state); err != nil {
 		return membershipBinding{}, snapshot, err
@@ -283,7 +291,7 @@ func (a *MembershipAdapter) validateTerminalBinding(state membershipBinding) err
 
 func (a *MembershipAdapter) process(rank int32) (Process, error) {
 	for _, process := range a.Processes {
-		if process.Rank == rank {
+		if rank >= process.Rank && int64(rank) < int64(process.Rank)+int64(len(process.Membership.Members)) {
 			return process, nil
 		}
 	}

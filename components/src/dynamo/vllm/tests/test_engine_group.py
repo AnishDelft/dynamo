@@ -106,7 +106,6 @@ async def test_retirement_withdraws_without_querying_stopped_engine_core(worker)
     await worker.refresh()
     worker.discovery.instance_ids.return_value = [7]
     worker.rank = 2
-    worker.member_id = "dp-2"
     worker.drain_requests = True
     worker.engine.get_external_elastic_ep_status.return_value = NativeStatus(
         phase="completed", operation_id="retire", epoch="epoch-2"
@@ -218,6 +217,39 @@ async def test_runtime_restart_requires_fresh_proof_not_controller_ack(worker):
     await restarted.refresh()
     assert restarted.is_admitted
     restarted.verify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_packed_range_keeps_local_ownership_after_growth_and_retires_together(
+    worker,
+):
+    worker.rank_count = 2
+    await worker.refresh()
+    assert worker.status()["member_ids"] == ["dp-0", "dp-1"]
+    assert worker.is_admitted
+
+    worker.engine.get_external_elastic_ep_status.return_value = NativeStatus(
+        phase="completed",
+        operation_id="grow",
+        epoch="epoch-2",
+        effective_data_parallel_size=4,
+    )
+    await worker.refresh()
+    assert worker.status()["member_ids"] == ["dp-0", "dp-1"]
+    assert worker.is_admitted
+
+    worker.rank = 2
+    worker.engine.get_external_elastic_ep_status.return_value = NativeStatus(
+        phase="completed",
+        operation_id="shrink",
+        epoch="epoch-3",
+        effective_data_parallel_size=2,
+    )
+    await worker.refresh()
+    assert worker.status()["member_ids"] == ["dp-2", "dp-3"]
+    assert worker.status()["retired"]
+    assert worker.status()["withdrawn"]
+    assert not worker.is_admitted
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -53,6 +52,9 @@ func (a *MembershipAdapter) ValidatePlan(
 			process, err := a.processForMember(member.Members[0].ID)
 			if err != nil {
 				return enginegroup.PreflightResult{}, err
+			}
+			if member.Members[0].ID != process.Membership.Members[0].ID {
+				continue
 			}
 			failure, err := a.ManagedDrainValidator(ctx, groupID, process, binding.Instances[process.Rank])
 			if err != nil {
@@ -252,7 +254,7 @@ func (a *MembershipAdapter) validateJoining(target enginegroup.MembershipTarget)
 				return fmt.Errorf("joining identities do not match the planned native members")
 			}
 			process, err := a.processForMember(member.ID)
-			if err != nil || !reflect.DeepEqual(process.Membership, enginegroup.ReplicaMembership{
+			if err != nil || !containsMemberSubset([]enginegroup.ReplicaMembership{process.Membership}, enginegroup.ReplicaMembership{
 				ReplicaID: joining.ReplicaID, Members: []enginegroup.NativeMemberIncarnation{member},
 			}) {
 				return fmt.Errorf("joining member %s does not match its frozen runtime binding", member.ID)

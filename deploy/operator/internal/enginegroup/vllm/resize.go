@@ -12,16 +12,17 @@ import (
 	"sync"
 )
 
-// Participant pins an existing DP rank to one API process observed before submission.
+// Participant pins an existing client's first rank and local count to its API lifetime.
 // Client must not be nil. The expected instance must never be refreshed merely to make a retry succeed.
 type Participant struct {
 	Rank               int32
+	LocalSize          int32
 	ExpectedInstanceID string
 	Client             *Client
 }
 
 // Resize describes the native projection of one already-persisted membership target.
-// Participants includes every old rank, including ranks that will leave on suffix shrink.
+// Participant ranges cover every old rank, including ranges that leave on suffix shrink.
 // Joiners are launched separately; this control does not wait for their serving readiness before submission.
 type Resize struct {
 	OperationID          string
@@ -39,7 +40,7 @@ type RankResult struct {
 	Err    error
 }
 
-// Apply sends an identical operation and target concurrently to all old-rank API processes.
+// Apply sends an identical operation and target concurrently to all old clients.
 // The resize must already be durable before this call. No background task or in-memory transaction survives it.
 // An invocation failure does not cancel peer requests: they may already be executing the collective.
 // Any returned error requires observation and, where safe, replay of this identical resize, never rollback by HTTP code.
@@ -73,7 +74,7 @@ func (r Resize) Apply(ctx context.Context) ([]RankResult, error) {
 
 func (r Resize) validate() error {
 	// Planned resizing is over a complete, healthy old world, not a sparse survivor mask.
-	if r.BaseDataParallelSize <= 0 || int64(len(r.Participants)) != int64(r.BaseDataParallelSize) {
+	if r.BaseDataParallelSize <= 0 || len(r.Participants) == 0 {
 		return fmt.Errorf("vLLM external resize requires every rank of a positive base DP world")
 	}
 	if r.NewDataParallelSize == r.BaseDataParallelSize {
@@ -82,8 +83,18 @@ func (r Resize) validate() error {
 	ranks := make(map[int32]bool, len(r.Participants))
 	instances := make(map[string]bool, len(r.Participants))
 	for _, participant := range r.Participants {
-		if participant.Rank < 0 || participant.Rank >= r.BaseDataParallelSize || ranks[participant.Rank] {
-			return fmt.Errorf("vLLM participants must contain every old DP rank exactly once")
+		end := int64(participant.Rank) + int64(participant.LocalSize)
+		if participant.Rank < 0 || participant.LocalSize < 1 || end > int64(r.BaseDataParallelSize) {
+			return fmt.Errorf("vLLM participants must own complete ranges within the base topology")
+		}
+		if participant.Rank < r.NewDataParallelSize && int64(r.NewDataParallelSize) < end {
+			return fmt.Errorf("vLLM target cannot cut a client's local engine range")
+		}
+		for rank := participant.Rank; int64(rank) < end; rank++ {
+			if ranks[rank] {
+				return fmt.Errorf("vLLM participants must contain every old DP rank exactly once")
+			}
+			ranks[rank] = true
 		}
 		if instances[participant.ExpectedInstanceID] {
 			return fmt.Errorf("vLLM participants must identify independent API processes")
@@ -95,8 +106,10 @@ func (r Resize) validate() error {
 		if err := request.validate(); err != nil {
 			return err
 		}
-		ranks[participant.Rank] = true
 		instances[participant.ExpectedInstanceID] = true
+	}
+	if len(ranks) != int(r.BaseDataParallelSize) {
+		return fmt.Errorf("vLLM external resize requires every rank of the base world")
 	}
 	return nil
 }

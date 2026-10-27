@@ -71,7 +71,11 @@ def _identifier(body: dict, name: str) -> str:
 def uses_external_elastic_ep(engine: AsyncLLM) -> bool:
     """Select native external ownership without changing the legacy Ray path."""
     parallel = engine.vllm_config.parallel_config
-    return parallel.enable_elastic_ep and parallel.data_parallel_external_lb
+    return parallel.enable_elastic_ep and (
+        parallel.data_parallel_external_lb
+        or parallel.data_parallel_backend == "mp"
+        and parallel.elastic_ep_auto_bootstrap
+    )
 
 
 def _status_payload(status: object) -> dict[str, Any]:

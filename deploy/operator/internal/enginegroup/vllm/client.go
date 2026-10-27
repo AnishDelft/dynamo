@@ -59,7 +59,7 @@ type Status struct {
 	Error                     *string `json:"error"`
 }
 
-// ScaleRequest carries the same operation and target to every old rank, with that rank's own instance precondition.
+// ScaleRequest carries the same operation and target to every old client, with its own instance precondition.
 // Neither identifier is optional in the Dynamo integration, even though vLLM accepts legacy uncorrelated requests.
 type ScaleRequest struct {
 	OperationID         string `json:"operation_id"`
@@ -81,7 +81,7 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("vLLM %s returned HTTP %d: %s", e.Path, e.StatusCode, e.Body)
 }
 
-// Client addresses one native vLLM engine, directly or through its Dynamo worker.
+// Client addresses one native vLLM control process, directly or through its Dynamo worker.
 // It does not address a load-balanced service.
 // The immutable base URL is private so an observed process cannot silently be retargeted.
 type Client struct {
@@ -92,7 +92,7 @@ type Client struct {
 	ScaleTimeout       time.Duration
 }
 
-// NewClient constructs one rank's control client without mutating httpClient.
+// NewClient constructs one API process's control client without mutating httpClient.
 // httpClient must not be nil. The URL identifies the native API process, not a Dynamo wrapper.
 func NewClient(rawBaseURL string, httpClient *http.Client) (*Client, error) {
 	// Reject ambiguous destinations rather than following a redirect to another engine process.
