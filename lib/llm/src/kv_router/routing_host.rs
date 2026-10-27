@@ -65,6 +65,11 @@ const OUTPUT_REPLAY_CONSUMER_RUNTIME_KEY: &str = "output_replay_consumer";
 /// Bounds the wait for a worker's trailing typed error after a terminal frame.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+// Keep router-origin placement failures distinguishable from engine refusals.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct UnknownWorkerTarget(#[source] pub(crate) DynamoError);
+
 pub(crate) fn is_cancelled(error: &Error) -> bool {
     match_error_chain(error.as_ref(), &[ErrorType::Cancelled], &[])
 }
@@ -659,9 +664,15 @@ impl RoutingHost {
         if let Some((worker_id, field)) = target
             && !self.inner.client.is_instance_discovered(worker_id)
         {
-            return Err(invalid_argument(format!(
-                "nvext.{field}={worker_id} does not identify a known worker"
-            )));
+            return Err(UnknownWorkerTarget(
+                DynamoError::builder()
+                    .error_type(ErrorType::InvalidArgument)
+                    .message(format!(
+                        "nvext.{field}={worker_id} does not identify a known worker"
+                    ))
+                    .build(),
+            )
+            .into());
         }
         Ok(())
     }
