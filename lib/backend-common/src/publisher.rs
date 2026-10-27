@@ -111,6 +111,7 @@ fn setup_kv_publishers(
                 endpoint,
                 topic,
                 image_token_id,
+                heartbeat_timeout,
                 recovery,
                 ..
             } => (
@@ -119,6 +120,8 @@ fn setup_kv_publishers(
                     topic,
                     image_token_id,
                     video_token_id: None,
+                    expected_rank: Some(dp_rank),
+                    liveness: heartbeat_timeout.map(|timeout| (dp_rank, timeout)),
                     recovery,
                 }),
                 None,
